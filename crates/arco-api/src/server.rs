@@ -32,7 +32,7 @@ use arco_uc::context::UnityCatalogRequestContext;
 use arco_uc::error::UnityCatalogError;
 use arco_uc::{
     CompiledPermissionSource, MetastorePermissionSource, UnityCatalogState, event_stream_router,
-    unity_catalog_router,
+    governed_catalog_read_router, unity_catalog_router,
 };
 
 use crate::compactor_client::CompactorClient;
@@ -380,7 +380,11 @@ async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ReadyResponse {
                 ready: false,
-                message: Some(format!("storage check failed: {e}")),
+                message: Some(if state.config.governed_catalog_read.is_some() {
+                    "storage check failed".to_string()
+                } else {
+                    format!("storage check failed: {e}")
+                }),
             }),
         ),
     }
@@ -844,19 +848,74 @@ impl Server {
     }
 
     /// Creates the router with all routes and middleware.
-    #[allow(clippy::cognitive_complexity, clippy::expect_used)]
     fn create_router(
         &self,
         state: Arc<AppState>,
         credential_provider: Option<Arc<dyn CredentialProvider>>,
     ) -> Router {
-        // Build CORS layer from config
-        let cors = self.build_cors_layer();
+        let router = Router::new()
+            .route("/health", get(health))
+            .route("/version", get(version))
+            .route("/ready", get(ready));
+        let router = if let Some(profile) = state.config.governed_catalog_read.as_ref() {
+            let uc_config = arco_uc::UnityCatalogConfig {
+                request_timeout: Some(Duration::from_secs(15)),
+                table_read_storage_root: table_read_storage_root(
+                    state.config.storage.bucket.as_deref(),
+                ),
+                ..arco_uc::UnityCatalogConfig::default()
+            };
+            let uc_state = Self::unity_catalog_state(&state, uc_config)
+                .with_audit_emitter(state.audit().clone());
+            Self::mount_unity_catalog(
+                router,
+                &state,
+                governed_catalog_read_router(uc_state, profile.clone()),
+            )
+        } else {
+            Self::mount_application_routes(router, &state, credential_provider)
+        };
+        router
+            .layer(self.build_cors_layer())
+            .layer(TraceLayer::new_for_http())
+            .layer(middleware::from_fn(crate::metrics::metrics_middleware))
+            .with_state(state)
+    }
 
+    fn unity_catalog_state(
+        state: &AppState,
+        config: arco_uc::UnityCatalogConfig,
+    ) -> UnityCatalogState {
+        UnityCatalogState::with_config(Arc::clone(&state.storage), config)
+            .with_catalog_authority_bindings(state.catalog_authority_bindings())
+            .with_managed_delta_storage(state.managed_delta_storage.clone())
+            .with_permission_source(Arc::clone(&state.catalog_permissions))
+    }
+
+    fn mount_unity_catalog(
+        router: Router<Arc<AppState>>,
+        state: &Arc<AppState>,
+        uc_router: Router,
+    ) -> Router<Arc<AppState>> {
+        let service = ServiceBuilder::new()
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(state),
+                unity_catalog_auth_middleware,
+            ))
+            .service(uc_router.into_service::<Body>());
+        router.nest_service(state.config.unity_catalog.mount_prefix.as_str(), service)
+    }
+
+    #[allow(clippy::cognitive_complexity, clippy::expect_used)]
+    fn mount_application_routes(
+        router: Router<Arc<AppState>>,
+        state: &Arc<AppState>,
+        credential_provider: Option<Arc<dyn CredentialProvider>>,
+    ) -> Router<Arc<AppState>> {
         let auth_layer =
-            middleware::from_fn_with_state(Arc::clone(&state), crate::context::auth_middleware);
+            middleware::from_fn_with_state(Arc::clone(state), crate::context::auth_middleware);
         let task_auth_layer = middleware::from_fn_with_state(
-            Arc::clone(&state),
+            Arc::clone(state),
             crate::routes::tasks::task_auth_middleware,
         );
         let rate_limit_layer = middleware::from_fn_with_state(
@@ -867,18 +926,13 @@ impl Server {
             Arc::clone(&state.rate_limit),
             crate::rate_limit::rate_limit_middleware,
         );
-        let metrics_layer = middleware::from_fn(crate::metrics::metrics_middleware);
         let metrics_handler = if state.config.posture.is_public() {
             get(|| async { StatusCode::NOT_FOUND })
         } else {
             get(api_metrics)
         };
 
-        let mut router = Router::new()
-            // Health, ready, and metrics endpoints (no auth required)
-            .route("/health", get(health))
-            .route("/version", get(version))
-            .route("/ready", get(ready))
+        let mut router = router
             .route("/metrics", metrics_handler)
             // API routes (auth via RequestContext extractor)
             .nest(
@@ -926,7 +980,7 @@ impl Server {
             }
             tracing::info!("control-store operator endpoints enabled (/internal/control-store/*)");
             let internal_auth_layer =
-                middleware::from_fn_with_state(Arc::clone(&state), crate::context::auth_middleware);
+                middleware::from_fn_with_state(Arc::clone(state), crate::context::auth_middleware);
             router = router.nest(
                 "/internal",
                 crate::routes::internal_operator_routes().layer(internal_auth_layer),
@@ -965,7 +1019,7 @@ impl Server {
 
             let iceberg_service = ServiceBuilder::new()
                 .layer(middleware::from_fn_with_state(
-                    Arc::clone(&state),
+                    Arc::clone(state),
                     iceberg_auth_middleware,
                 ))
                 .service(iceberg_router(iceberg_state).into_service::<Body>());
@@ -999,10 +1053,7 @@ impl Server {
                 event_streams,
                 ..arco_uc::UnityCatalogConfig::default()
             };
-            let uc_state = UnityCatalogState::with_config(Arc::clone(&state.storage), uc_config)
-                .with_catalog_authority_bindings(state.catalog_authority_bindings())
-                .with_managed_delta_storage(state.managed_delta_storage.clone())
-                .with_permission_source(Arc::clone(&state.catalog_permissions));
+            let uc_state = Self::unity_catalog_state(state, uc_config);
 
             if events_enabled {
                 let event_service = ServiceBuilder::new()
@@ -1021,25 +1072,13 @@ impl Server {
                 router = router.nest_service("/api/v1/usage", usage);
             }
             if state.config.unity_catalog.enabled {
-                let uc_service = ServiceBuilder::new()
-                    .layer(middleware::from_fn_with_state(
-                        Arc::clone(&state),
-                        unity_catalog_auth_middleware,
-                    ))
-                    .service(unity_catalog_router(uc_state).into_service::<Body>());
                 let mount_prefix = &state.config.unity_catalog.mount_prefix;
                 tracing::info!("Unity Catalog facade enabled at {mount_prefix}/*");
-                router = router.nest_service(mount_prefix.as_str(), uc_service);
+                router = Self::mount_unity_catalog(router, state, unity_catalog_router(uc_state));
             }
         }
 
         router
-            // Middleware (order matters): Metrics outermost for timing, then trace, then CORS.
-            .layer(cors)
-            .layer(TraceLayer::new_for_http())
-            .layer(metrics_layer)
-            // Shared state
-            .with_state(state)
     }
 
     /// Builds the CORS layer from configuration.
@@ -1151,6 +1190,10 @@ impl Server {
     #[allow(clippy::cognitive_complexity)]
     pub async fn serve(&self) -> Result<()> {
         self.validate_config()?;
+        let governed = self.config.governed_catalog_read.is_some();
+        let iceberg_credentials = !governed
+            && self.config.iceberg.enabled
+            && self.config.iceberg.enable_credential_vending;
 
         // Initialize metrics before starting the server
         crate::metrics::init_metrics();
@@ -1158,12 +1201,7 @@ impl Server {
         arco_iceberg::metrics::register_metrics();
 
         #[cfg(feature = "gcp")]
-        let credential_provider: Option<Arc<dyn CredentialProvider>> = if self
-            .config
-            .iceberg
-            .enabled
-            && self.config.iceberg.enable_credential_vending
-        {
+        let credential_provider: Option<Arc<dyn CredentialProvider>> = if iceberg_credentials {
             match GcsCredentialProvider::from_environment().await {
                 Ok(provider) => {
                     tracing::info!("Iceberg credential vending enabled for GCS");
@@ -1180,7 +1218,7 @@ impl Server {
 
         #[cfg(not(feature = "gcp"))]
         let credential_provider: Option<Arc<dyn CredentialProvider>> = {
-            if self.config.iceberg.enabled && self.config.iceberg.enable_credential_vending {
+            if iceberg_credentials {
                 tracing::warn!(
                     "Credential vending requested but `gcp` feature is not enabled; skipping"
                 );
@@ -1190,48 +1228,52 @@ impl Server {
 
         let state = self.create_state()?;
         let http_addr = SocketAddr::from(([0, 0, 0, 0], self.config.http_port));
-        let grpc_addr = SocketAddr::from(([0, 0, 0, 0], self.config.grpc_port));
         let router = self.create_router(Arc::clone(&state), credential_provider);
-        let grpc_service = grpc_transactions::service(state);
-
-        tracing::info!(
-            http_port = self.config.http_port,
-            grpc_port = self.config.grpc_port,
-            "Starting Arco API server"
-        );
 
         let http_listener = tokio::net::TcpListener::bind(http_addr)
             .await
             .map_err(|e| arco_core::Error::Internal {
                 message: format!("failed to bind HTTP listener to {http_addr}: {e}"),
             })?;
+        let serve_http = async {
+            axum::serve(http_listener, router)
+                .await
+                .map_err(|e| arco_core::Error::Internal {
+                    message: format!("http server error: {e}"),
+                })
+        };
+        if governed {
+            tracing::info!(
+                http_port = self.config.http_port,
+                "Starting governed catalog read server"
+            );
+            return serve_http.await;
+        }
 
+        let grpc_addr = SocketAddr::from(([0, 0, 0, 0], self.config.grpc_port));
+        let grpc_service = grpc_transactions::service(state);
+        tracing::info!(
+            http_port = self.config.http_port,
+            grpc_port = self.config.grpc_port,
+            "Starting Arco API server"
+        );
         let grpc_listener = tokio::net::TcpListener::bind(grpc_addr)
             .await
             .map_err(|e| arco_core::Error::Internal {
                 message: format!("failed to bind gRPC listener to {grpc_addr}: {e}"),
             })?;
 
-        tokio::try_join!(
-            async {
-                axum::serve(http_listener, router)
-                    .await
-                    .map_err(|e| arco_core::Error::Internal {
-                        message: format!("http server error: {e}"),
-                    })
-            },
-            async {
-                GrpcServer::builder()
-                    .add_service(grpc_service)
-                    .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
-                        grpc_listener,
-                    ))
-                    .await
-                    .map_err(|e| arco_core::Error::Internal {
-                        message: format!("gRPC server error: {e}"),
-                    })
-            }
-        )?;
+        tokio::try_join!(serve_http, async {
+            GrpcServer::builder()
+                .add_service(grpc_service)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                    grpc_listener,
+                ))
+                .await
+                .map_err(|e| arco_core::Error::Internal {
+                    message: format!("gRPC server error: {e}"),
+                })
+        })?;
 
         Ok(())
     }
@@ -1262,6 +1304,20 @@ impl Server {
     fn validate_config(&self) -> Result<()> {
         self.config.catalog_authority_bindings()?;
         self.config.event_stream_bindings()?;
+        let governed = self.config.governed_catalog_read.as_ref();
+        if let Some(profile) = governed {
+            profile.validate()?;
+            if self.config.debug
+                || self.config.catalog_control_v1_root.is_some()
+                || !table_read_storage_root(self.config.storage.bucket.as_deref())
+                    .is_some_and(|root| root.starts_with("s3://"))
+            {
+                return Err(arco_core::Error::InvalidInput(
+                    "governed catalog read requires authenticated S3 on the legacy catalog authority"
+                        .to_string(),
+                ));
+            }
+        }
 
         if !self.config.posture.is_dev() && self.config.debug {
             return Err(arco_core::Error::InvalidInput(
@@ -1309,7 +1365,7 @@ impl Server {
                 ));
             }
 
-            if !self.config.posture.is_dev() {
+            if !self.config.posture.is_dev() || governed.is_some() {
                 if self
                     .config
                     .jwt
@@ -1318,7 +1374,12 @@ impl Server {
                     .is_none_or(|value| value.trim().is_empty())
                 {
                     return Err(arco_core::Error::InvalidInput(
-                        "jwt.issuer is required when debug=false and posture!=dev".to_string(),
+                        if governed.is_some() {
+                            "jwt.issuer is required for governed catalog read"
+                        } else {
+                            "jwt.issuer is required when debug=false and posture!=dev"
+                        }
+                        .to_string(),
                     ));
                 }
                 if self
@@ -1329,11 +1390,17 @@ impl Server {
                     .is_none_or(|value| value.trim().is_empty())
                 {
                     return Err(arco_core::Error::InvalidInput(
-                        "jwt.audience is required when debug=false and posture!=dev".to_string(),
+                        if governed.is_some() {
+                            "jwt.audience is required for governed catalog read"
+                        } else {
+                            "jwt.audience is required when debug=false and posture!=dev"
+                        }
+                        .to_string(),
                     ));
                 }
             }
-
+        }
+        if !self.config.debug && governed.is_none() {
             self.config.task_token.validate().map_err(|err| {
                 arco_core::Error::InvalidInput(format!(
                     "task token config invalid when debug=false: {err}"
@@ -1368,7 +1435,8 @@ impl Server {
             }
         }
 
-        if self.config.http_port != 0
+        if governed.is_none()
+            && self.config.http_port != 0
             && self.config.grpc_port != 0
             && self.config.http_port == self.config.grpc_port
         {
@@ -1667,6 +1735,48 @@ mod tests {
         builder.config.jwt.issuer = Some("test-issuer".to_string());
         builder.config.jwt.audience = Some("test-audience".to_string());
         assert!(builder.build().validate_config().is_ok());
+    }
+
+    #[test]
+    fn governed_catalog_config_requires_exact_admission_and_reader_jwt() -> Result<()> {
+        let profile = crate::config::GovernedCatalogReadConfig {
+            tenant_id: "pilot".to_string(),
+            workspace_id: "analytics".to_string(),
+            table_ids: vec![uuid::Uuid::now_v7().to_string()],
+        };
+        let mut config = Config {
+            posture: Posture::Private,
+            governed_catalog_read: Some(profile.clone()),
+            ..Config::default()
+        };
+        config.storage.bucket = Some("s3://governed-bucket".to_string());
+        config.jwt.hs256_secret = Some("reader-test-secret".to_string());
+        config.jwt.issuer = Some("reader-test-issuer".to_string());
+        config.jwt.audience = Some("reader-test-audience".to_string());
+        let validate = |config: &Config| Server::new(config.clone()).validate_config();
+        validate(&config)?;
+        config.debug = true;
+        assert!(validate(&config).is_err());
+        config.debug = false;
+        config.jwt.audience = None;
+        assert!(
+            validate(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("audience")
+        );
+        config.jwt.audience = Some("reader-test-audience".to_string());
+        config.governed_catalog_read = Some(crate::config::GovernedCatalogReadConfig {
+            table_ids: vec![profile.table_ids[0].clone(); 2],
+            ..profile
+        });
+        assert!(
+            validate(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("distinct")
+        );
+        Ok(())
     }
 
     #[test]

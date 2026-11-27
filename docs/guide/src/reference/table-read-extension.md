@@ -4,6 +4,47 @@ Arco serves two owner read profiles on the same endpoints. Use an explicit
 `delta_version` for a [pinned managed Delta snapshot](#pinned-managed-delta-snapshot).
 The request shape below selects the single-object Parquet profile.
 
+## Governed catalog read deployment
+
+Set `ARCO_GOVERNED_CATALOG_READ` to a JSON object with an exact tenant,
+workspace and 1–64 distinct stable table UUIDs approved by the operator for
+full-table disclosure. This profile uses an S3-compatible bucket and the
+existing workspace-scoped catalog authority. The JWT issuer and audience are
+required. Use a dedicated reader audience and give the deployment a read-only
+storage role restricted to the admitted workspace and readiness key.
+
+```sh
+export ARCO_GOVERNED_CATALOG_READ='{"tenant_id":"acme","workspace_id":"analytics","table_ids":["019b0000-0000-7000-8000-000000000001"]}'
+```
+
+Under the configured UC mount prefix, the HTTP listener serves the following
+authenticated catalog operations.
+
+| Method and path | Result |
+|---|---|
+| `GET /extensions/tables?catalog_name=default&schema_name=analytics` | Lists admitted IDs, table names and formats in that schema for the authenticated principal. |
+| `POST /extensions/table-descriptors/{table_id}` | Describes one admitted object or explicit managed Delta version. |
+| `POST /extensions/table-reads/{table_id}` | Returns bytes when the request supplies the matching `expected_snapshot_id`. |
+
+The authenticated tenant and workspace must match the deployment profile.
+Discovery uses current table-level `BROWSE` or `SELECT` and returns the
+entire bounded visible set, sorted by name. A schema with zero visible tables
+returns an empty list. Descriptors and bytes require current `SELECT` and
+the governed storage binding. A stale permissions or governance view
+prevents disclosure. A rename keeps the table ID and grants and changes the
+snapshot fingerprint. Replacement under the same name requires a new admission.
+
+The process also serves `/health`, `/ready` and `/version`. It opens only
+the HTTP listener. Provision tables and republish governance through the
+owner's separately authenticated service. Complete and govern that publication
+before attempting a reader request.
+
+Approve only datasets whose policy permits every row and column to reach the
+authorized reader. Remove approval when the classification changes. The
+read profile supplies a policy decision and snapshot identity at disclosure.
+The consuming engine owns its private materializations, result policy and
+retention after disclosure.
+
 ## Single-object Parquet profile
 
 `POST /api/2.1/unity-catalog/extensions/table-reads/{table_id}` is an

@@ -2,7 +2,7 @@
 
 use axum::Router;
 use axum::error_handling::HandleErrorLayer;
-use axum::extract::OriginalUri;
+use axum::extract::{Extension, OriginalUri};
 use axum::http::{Method, StatusCode, Uri};
 use axum::middleware;
 use tower::ServiceBuilder;
@@ -13,7 +13,7 @@ use tower_http::trace::TraceLayer;
 use crate::context::context_middleware;
 use crate::error::{UnityCatalogError, UnityCatalogErrorDetail, UnityCatalogErrorResponse};
 use crate::routes;
-use crate::state::UnityCatalogState;
+use crate::state::{GovernedCatalogReadConfig, UnityCatalogState};
 
 /// Creates the native event stream router for an authenticated ingress.
 pub fn event_stream_router(state: UnityCatalogState) -> Router {
@@ -31,10 +31,6 @@ pub fn usage_router(state: UnityCatalogState) -> Router {
 
 /// Creates the Unity Catalog facade router.
 pub fn unity_catalog_router(state: UnityCatalogState) -> Router {
-    let request_timeout = state.config.request_timeout;
-    let concurrency_limit = state.config.concurrency_limit;
-    let table_reads_enabled = state.config.table_reads_enabled;
-
     let mut router = Router::new()
         .route(
             "/openapi.json",
@@ -50,24 +46,40 @@ pub fn unity_catalog_router(state: UnityCatalogState) -> Router {
         .merge(routes::delta_commits::routes())
         .merge(routes::delta::config::routes());
 
-    if table_reads_enabled {
+    if state.config.table_reads_enabled {
         router = router.merge(routes::table_reads::routes());
     }
     if state.config.activity_events_enabled {
         router = router.merge(routes::event_streams::activity_routes());
     }
 
+    with_common_layers(router.fallback(not_found), state)
+}
+
+/// Creates the bounded governed table serving router.
+///
+/// The caller supplies verified bearer identity and validates the profile at startup.
+pub fn governed_catalog_read_router(
+    state: UnityCatalogState,
+    profile: GovernedCatalogReadConfig,
+) -> Router {
+    let router = routes::table_reads::routes()
+        .merge(routes::table_reads::discovery_routes())
+        .layer(Extension(std::sync::Arc::new(profile)));
+    with_common_layers(router, state)
+}
+
+fn with_common_layers(router: Router<UnityCatalogState>, state: UnityCatalogState) -> Router {
     let router = router
-        .fallback(not_found)
         .layer(middleware::from_fn(context_middleware))
         .layer(TraceLayer::new_for_http());
 
-    let router = match concurrency_limit {
+    let router = match state.config.concurrency_limit {
         Some(limit) => router.layer(ConcurrencyLimitLayer::new(limit)),
         None => router,
     };
 
-    let router = match request_timeout {
+    let router = match state.config.request_timeout {
         Some(timeout) => router.layer(
             ServiceBuilder::new()
                 .layer(HandleErrorLayer::new(handle_timeout_error))

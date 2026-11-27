@@ -46,6 +46,8 @@ use uuid::Uuid;
 
 #[path = "support/event_streams.rs"]
 mod event_streams;
+#[path = "support/governed_catalog_read.rs"]
+mod governed_catalog_read;
 
 #[path = "support/usage.rs"]
 mod usage;

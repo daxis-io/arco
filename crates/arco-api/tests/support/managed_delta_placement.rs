@@ -153,7 +153,7 @@ async fn production_managed_delta_allocation_minio() {
         "operation_id": Uuid::now_v7(), "owner": READER,
         "provisioning_fingerprint": "managed-delta-native-proof-v1"
     });
-    let receipt = allocate(&router, &catalog, &token, &root, &request).await;
+    let receipt = allocate(&router, &catalog, &token, &root, &request, evidence).await;
     let table_id = receipt.get("id").and_then(Value::as_str).unwrap();
     let location = receipt.get("location").and_then(Value::as_str).unwrap();
     write_proof_json(
@@ -406,11 +406,66 @@ async fn allocate(
     token: &str,
     root: &str,
     request: &Value,
+    evidence: &Path,
 ) -> Value {
     let foreign_owner =
         table_read_rs256_jwt(catalog.tenant_id(), catalog.workspace_id(), "other_owner");
     let (status, error) = post_json(router, ENSURE, &foreign_owner, request.clone()).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{error}");
+    let (receipt, statuses) = allocate_overlapping(router, token, request).await;
+    let table_id = receipt.get("id").and_then(Value::as_str).unwrap();
+    let uuid = Uuid::parse_str(table_id).unwrap();
+    assert_eq!(uuid.get_version_num(), 7);
+    let location = format!("{root}/{}/tables/{table_id}/", catalog.scope().prefix());
+    assert_eq!(
+        receipt.get("location").and_then(Value::as_str),
+        Some(location.as_str())
+    );
+    let tables = CatalogReader::new(catalog.clone())
+        .list_tables_in_schema(CATALOG, SCHEMA)
+        .await
+        .unwrap();
+    assert_eq!(tables.len(), 1, "expected one allocated table");
+    let row = tables.first().unwrap();
+    assert_eq!(row.id, table_id);
+    assert_eq!(row.name, TABLE);
+    assert_eq!(row.location.as_deref(), Some(location.as_str()));
+    assert_eq!(row.format.as_deref(), Some("delta"));
+    assert_eq!(row.table_type.as_deref(), Some("MANAGED"));
+    write_proof_json(
+        evidence,
+        &format!(
+            "allocation-overlap-{}-{}.json",
+            catalog.tenant_id(),
+            catalog.workspace_id()
+        ),
+        &json!({
+            "tenant": catalog.tenant_id(), "workspace": catalog.workspace_id(),
+            "statuses": statuses, "table_id": table_id,
+            "location": location, "rows": tables.len(),
+        }),
+    );
+    let bytes = catalog
+        .get_raw(&format!("delta/placements/{uuid}.json"))
+        .await
+        .unwrap();
+    let placement: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(placement.get("allocation"), Some(request));
+    assert_eq!(placement.get("location"), receipt.get("location"));
+    assert_eq!(placement.get("schema_digest"), receipt.get("schema_digest"));
+    publish(
+        catalog,
+        [
+            object(table_id, "TABLE", &format!("{CATALOG}.{SCHEMA}.{TABLE}")),
+            grant(table_id, "TABLE", "SELECT", LifecycleState::Active),
+            grant(table_id, "TABLE", "MODIFY", LifecycleState::Active),
+        ],
+    )
+    .await;
+    receipt
+}
+
+async fn allocate_overlapping(router: &Router, token: &str, request: &Value) -> (Value, [u16; 2]) {
     let [first, second]: [_; 2] = tokio::join!(
         post_json(router, ENSURE, token, request.clone()),
         post_json(router, ENSURE, token, request.clone()),
@@ -432,51 +487,7 @@ async fn allocate(
             assert_eq!(replay, (StatusCode::OK, receipt.clone()));
         }
     }
-    let table_id = receipt.get("id").and_then(Value::as_str).unwrap();
-    let uuid = Uuid::parse_str(table_id).unwrap();
-    assert_eq!(uuid.get_version_num(), 7);
-    let location = format!("{root}/{}/tables/{table_id}/", catalog.scope().prefix());
-    assert_eq!(
-        receipt.get("location").and_then(Value::as_str),
-        Some(location.as_str())
-    );
-    let tables = CatalogReader::new(catalog.clone())
-        .list_tables_in_schema(CATALOG, SCHEMA)
-        .await
-        .unwrap();
-    assert_eq!(tables.len(), 1, "expected one allocated table");
-    let row = tables.first().unwrap();
-    assert_eq!(row.id, table_id);
-    assert_eq!(row.name, TABLE);
-    assert_eq!(row.location.as_deref(), Some(location.as_str()));
-    assert_eq!(row.format.as_deref(), Some("delta"));
-    assert_eq!(row.table_type.as_deref(), Some("MANAGED"));
-    println!(
-        "{}",
-        json!({
-            "event": "concurrent-allocation", "tenant": catalog.tenant_id(),
-            "workspace": catalog.workspace_id(), "statuses": statuses, "table_id": table_id,
-            "location": location, "rows": tables.len(),
-        })
-    );
-    let bytes = catalog
-        .get_raw(&format!("delta/placements/{uuid}.json"))
-        .await
-        .unwrap();
-    let placement: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(placement.get("allocation"), Some(request));
-    assert_eq!(placement.get("location"), receipt.get("location"));
-    assert_eq!(placement.get("schema_digest"), receipt.get("schema_digest"));
-    publish(
-        catalog,
-        [
-            object(table_id, "TABLE", &format!("{CATALOG}.{SCHEMA}.{TABLE}")),
-            grant(table_id, "TABLE", "SELECT", LifecycleState::Active),
-            grant(table_id, "TABLE", "MODIFY", LifecycleState::Active),
-        ],
-    )
-    .await;
-    receipt
+    (receipt, statuses)
 }
 
 fn data_file(start: i64, amounts: &[i64]) -> Bytes {
@@ -657,7 +668,7 @@ async fn verify_isolation(
     let catalog = seed_scope(catalog_backend, other_tenant, WORKSPACE, root).await;
     seed_scope(catalog_backend, TENANT, "workspace2", root).await;
     let token = table_read_rs256_jwt(other_tenant, WORKSPACE, READER);
-    let receipt = allocate(router, &catalog, &token, root, request).await;
+    let receipt = allocate(router, &catalog, &token, root, request, evidence).await;
     let id = receipt.get("id").and_then(Value::as_str).unwrap();
     assert_ne!(id, original_id);
     let describe = extension_path("table-descriptors", original_id);

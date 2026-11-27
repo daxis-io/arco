@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use arco_core::storage::{StorageBackend, WritePrecondition, WriteResult};
 use arco_core::{DeltaPaths, ScopedStorage};
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -134,49 +133,18 @@ impl ManagedDeltaStorage {
         .with_storage_prefix(&self.prefix)?)
     }
 
-    /// Checks write, read, and cleanup under the current governed analytical root.
-    ///
-    /// Returns false if overlapping probes remove the temporary object in all three attempts.
+    /// Resolves the temporary object for a storage probe under the current governed root.
     ///
     /// # Errors
-    /// Returns governance, storage, or probe integrity errors.
-    pub async fn probe(&self, catalog: &ScopedStorage, operation_id: Uuid) -> Result<bool> {
+    /// Returns errors for unavailable or denied storage governance.
+    pub async fn probe_target(
+        &self,
+        catalog: &ScopedStorage,
+        operation_id: Uuid,
+    ) -> Result<(ScopedStorage, String)> {
         let path = format!("managed-delta/probes/{operation_id}");
         governed_root(catalog, &self.scoped_uri(catalog, &path)).await?;
-        let storage = self.scoped_storage(catalog)?;
-        let payload = Bytes::from_static(b"arco-managed-delta-storage-probe-v1");
-        for _ in 0..3 {
-            storage
-                .put_raw(&path, payload.clone(), WritePrecondition::DoesNotExist)
-                .await?;
-            let observed = async {
-                let Some(meta) = storage.head_raw(&path).await? else {
-                    return Ok(false);
-                };
-                if meta.size != payload.len() as u64 {
-                    return Err(CatalogError::storage("managed storage probe size mismatch"));
-                }
-                match storage.get_raw(&path).await {
-                    Ok(bytes) if bytes == payload => Ok(true),
-                    Ok(_) => Err(CatalogError::storage(
-                        "managed storage probe payload mismatch",
-                    )),
-                    Err(arco_core::Error::NotFound(_)) => Ok(false),
-                    Err(error) => Err(error.into()),
-                }
-            }
-            .await;
-            match observed {
-                // Another request can delete the key while this request is reading it.
-                Ok(false) => {}
-                result => {
-                    storage.delete(&path).await?;
-                    result?;
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
+        Ok((self.scoped_storage(catalog)?, path))
     }
 }
 

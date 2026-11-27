@@ -21,6 +21,7 @@ use arco_catalog::authz::decision::{AuthzDecision, AuthzRequest, DecisionOutcome
 use arco_catalog::authz::privileges::Privilege;
 use arco_catalog::managed_delta::{self, ManagedDeltaAllocation};
 use arco_catalog::{CatalogAuthority, WriteOptions};
+use arco_core::storage::WritePrecondition;
 use arco_core::{DeltaPaths, ScopedStorage, TableFormat};
 use arco_uc::is_event_stream_table;
 
@@ -98,13 +99,47 @@ pub(crate) async fn probe_managed_delta_storage(
         ApiError::from_status_and_message(503, "managed_delta_storage_unavailable")
     })?;
     let catalog = ctx.scoped_storage(state.storage_backend()?)?;
-    if !root.probe(&catalog, operation_id).await? {
-        return Err(ApiError::managed_storage_probe_busy());
+    let (storage, path) = root.probe_target(&catalog, operation_id).await?;
+    let backend_failure = |error: arco_core::Error| {
+        tracing::warn!(%error, "managed Delta storage probe failed");
+        ApiError::internal("managed storage probe failed")
+    };
+    let payload = Bytes::from_static(b"arco-managed-delta-storage-probe-v1");
+
+    for _ in 0..3 {
+        storage
+            .put_raw(&path, payload.clone(), WritePrecondition::DoesNotExist)
+            .await
+            .map_err(backend_failure)?;
+        let observed = async {
+            let Some(meta) = storage.head_raw(&path).await.map_err(backend_failure)? else {
+                return Ok(false);
+            };
+            if meta.size != payload.len() as u64 {
+                return Err(ApiError::internal("managed storage probe size mismatch"));
+            }
+            match storage.get_raw(&path).await {
+                Ok(bytes) if bytes == payload => Ok(true),
+                Ok(_) => Err(ApiError::internal("managed storage probe payload mismatch")),
+                Err(arco_core::Error::NotFound(_)) => Ok(false),
+                Err(error) => Err(backend_failure(error)),
+            }
+        }
+        .await;
+        match observed {
+            // Another request can delete the key while this request is reading it.
+            Ok(false) => {}
+            result => {
+                storage.delete(&path).await.map_err(backend_failure)?;
+                result?;
+                return Ok((
+                    [(axum::http::header::CACHE_CONTROL, "no-store")],
+                    Json(ManagedDeltaStorageProbeResponse { state: "passed" }),
+                ));
+            }
+        }
     }
-    Ok((
-        [(axum::http::header::CACHE_CONTROL, "no-store")],
-        Json(ManagedDeltaStorageProbeResponse { state: "passed" }),
-    ))
+    Err(ApiError::managed_storage_probe_busy())
 }
 
 #[utoipa::path(

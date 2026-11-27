@@ -27,10 +27,19 @@ use crate::config::Config;
 const ROOT: &str = "s3://analytical-bucket/approved";
 const PREFIX: &str = "approved/tenant=tenant1/workspace=workspace1/managed-delta/probes";
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum ProbeFault {
+    #[default]
+    PauseAfterHead,
+    LoseEveryWrite,
+    GetUnavailable,
+    ReadCorruptObject,
+}
+
 #[derive(Default)]
 struct InterleavedProbes {
     data: MemoryBackend,
-    lose_every_write: bool,
+    fault: ProbeFault,
     writes: AtomicUsize,
     heads: AtomicUsize,
     paused_after_head: Notify,
@@ -40,6 +49,9 @@ struct InterleavedProbes {
 #[async_trait::async_trait]
 impl StorageBackend for InterleavedProbes {
     async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+        if self.fault == ProbeFault::GetUnavailable {
+            return Err(arco_core::Error::storage("injected provider failure"));
+        }
         self.data.get(path).await
     }
 
@@ -55,7 +67,7 @@ impl StorageBackend for InterleavedProbes {
     ) -> arco_core::Result<WriteResult> {
         self.writes.fetch_add(1, Ordering::SeqCst);
         let result = self.data.put(path, data, precondition).await?;
-        if self.lose_every_write {
+        if self.fault == ProbeFault::LoseEveryWrite {
             self.data.delete(path).await?;
         }
         Ok(result)
@@ -73,7 +85,9 @@ impl StorageBackend for InterleavedProbes {
 
     async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
         let result = self.data.head(path).await?;
-        if !self.lose_every_write && self.heads.fetch_add(1, Ordering::SeqCst) == 0 {
+        if self.fault == ProbeFault::PauseAfterHead
+            && self.heads.fetch_add(1, Ordering::SeqCst) == 0
+        {
             self.paused_after_head.notify_one();
             self.deleted.notified().await;
         }
@@ -221,7 +235,7 @@ async fn managed_delta_storage_probe_recovers_when_overlapping_retry_deletes_bef
 async fn managed_delta_storage_probe_returns_backpressure_after_three_misses() -> anyhow::Result<()>
 {
     let data = Arc::new(InterleavedProbes {
-        lose_every_write: true,
+        fault: ProbeFault::LoseEveryWrite,
         ..InterleavedProbes::default()
     });
     let router = router(data.clone()).await?;
@@ -240,5 +254,50 @@ async fn managed_delta_storage_probe_returns_backpressure_after_three_misses() -
     );
     assert_eq!(data.writes.load(Ordering::SeqCst), 3);
     assert!(data.data.list("").await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn managed_delta_storage_probe_fails_without_retry_on_corruption_or_provider_error()
+-> anyhow::Result<()> {
+    let payload_len = b"arco-managed-delta-storage-probe-v1".len();
+    for (fault, existing) in [
+        (
+            ProbeFault::ReadCorruptObject,
+            Bytes::from_static(b"wrong size"),
+        ),
+        (
+            ProbeFault::ReadCorruptObject,
+            Bytes::from(vec![b'x'; payload_len]),
+        ),
+        (
+            ProbeFault::GetUnavailable,
+            Bytes::from_static(b"arco-managed-delta-storage-probe-v1"),
+        ),
+    ] {
+        let data = Arc::new(InterleavedProbes {
+            fault,
+            ..InterleavedProbes::default()
+        });
+        let router = router(data.clone()).await?;
+        let operation_id = Uuid::now_v7();
+        data.data
+            .put(
+                &format!("{PREFIX}/{operation_id}"),
+                existing,
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+        let (status, headers, receipt) = send_probe(router, operation_id, "owner").await?;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{receipt}");
+        assert_eq!(
+            receipt.get("code").and_then(Value::as_str),
+            Some("INTERNAL")
+        );
+        assert!(!headers.contains_key(axum::http::header::RETRY_AFTER));
+        assert_eq!(data.writes.load(Ordering::SeqCst), 1);
+        assert!(data.data.list("").await?.is_empty());
+    }
     Ok(())
 }

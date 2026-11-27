@@ -73,6 +73,8 @@ pub struct UnityCatalogState {
     pub audit_emitter: Option<AuditEmitter>,
     /// Exact-root catalog authority bindings; unlisted roots remain legacy.
     pub catalog_authority_bindings: Arc<CatalogAuthorityBindings>,
+    /// Arco-owned analytical storage for allocated Delta tables.
+    pub managed_delta_storage: Option<arco_catalog::managed_delta::ManagedDeltaStorage>,
 }
 
 impl UnityCatalogState {
@@ -87,6 +89,7 @@ impl UnityCatalogState {
             storage_governance_cache: Arc::new(PublishedStorageGovernanceCache::default()),
             audit_emitter: None,
             catalog_authority_bindings: Arc::new(CatalogAuthorityBindings::default()),
+            managed_delta_storage: None,
         }
     }
 
@@ -101,7 +104,18 @@ impl UnityCatalogState {
             storage_governance_cache: Arc::new(PublishedStorageGovernanceCache::default()),
             audit_emitter: None,
             catalog_authority_bindings: Arc::new(CatalogAuthorityBindings::default()),
+            managed_delta_storage: None,
         }
+    }
+
+    /// Sets the deployment's approved analytical storage.
+    #[must_use]
+    pub fn with_managed_delta_storage(
+        mut self,
+        storage: Option<arco_catalog::managed_delta::ManagedDeltaStorage>,
+    ) -> Self {
+        self.managed_delta_storage = storage;
+        self
     }
 
     /// Adds a compiled permission view for UC compatibility routes.

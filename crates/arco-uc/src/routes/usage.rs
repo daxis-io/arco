@@ -319,7 +319,7 @@ async fn usage_root(
     {
         return Err(conflict("usage_table_schema_mismatch"));
     }
-    DeltaRoot::resolve(state, ctx, &table)
+    DeltaRoot::resolve(state, ctx, &table, false)
 }
 
 #[utoipa::path(

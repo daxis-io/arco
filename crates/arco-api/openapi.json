@@ -1557,6 +1557,50 @@
         ]
       }
     },
+    "/api/v1/managed-delta/ensure": {
+      "post": {
+        "tags": [
+          "Delta"
+        ],
+        "operationId": "ensure_managed_delta",
+        "requestBody": {
+          "description": "UUIDv7 operation_id, authenticated owner, and provisioning_fingerprint",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Allocated managed Delta fixture or identical replay"
+          },
+          "400": {
+            "description": "Invalid allocation intent"
+          },
+          "401": {
+            "description": "Missing or invalid authentication"
+          },
+          "403": {
+            "description": "Allocation privilege or managed root denied"
+          },
+          "409": {
+            "description": "Intent or table incarnation conflict"
+          },
+          "503": {
+            "description": "Approved analytical storage or governance unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
     "/api/v1/namespaces": {
       "get": {
         "tags": [

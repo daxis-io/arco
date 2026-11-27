@@ -89,6 +89,7 @@ pub mod governance;
 pub mod idempotency;
 pub mod identity;
 pub mod lock;
+pub mod managed_delta;
 pub mod manifest;
 pub mod metastore;
 pub mod metrics;

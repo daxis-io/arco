@@ -2348,6 +2348,7 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
             posture: Posture::Private,
             storage: arco_api::config::StorageConfig {
                 bucket: Some("test-bucket".to_string()),
+                managed_delta_root: None,
             },
             jwt: arco_api::config::JwtConfig {
                 hs256_secret: Some(TEST_JWT_SECRET.to_string()),

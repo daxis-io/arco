@@ -125,20 +125,33 @@ async fn allocated_table_replays_and_uses_one_analytical_log_root() {
         (status, allocated.clone())
     );
     let mut changed = payload;
-    changed["provisioning_fingerprint"] = json!("changed");
+    *changed
+        .get_mut("provisioning_fingerprint")
+        .expect("fingerprint") = json!("changed");
     assert_eq!(
         request(&api, "POST", path, &actor, &changed).await.0,
         StatusCode::CONFLICT
     );
 
-    let id = allocated["id"].as_str().expect("table ID");
+    let id = allocated
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("table ID");
     let table_id = Uuid::parse_str(id).expect("table UUID");
     let location = root
         .table_location(TENANT, WORKSPACE, table_id)
         .expect("managed URI");
     assert_ne!(id, op_id);
-    assert_eq!(allocated["location"], location);
-    assert_eq!(allocated["properties"]["arco.managed_delta_owner"], READER);
+    assert_eq!(
+        allocated.get("location").and_then(Value::as_str),
+        Some(location.as_str())
+    );
+    assert_eq!(
+        allocated
+            .pointer("/properties/arco.managed_delta_owner")
+            .and_then(Value::as_str),
+        Some(READER)
+    );
     admit_object(&fixture.storage, id, "TABLE", &["SELECT", "MODIFY"]).await;
     assert_split_delta_commits(
         &api,
@@ -227,8 +240,18 @@ async fn assert_split_delta_commits(
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{listed}");
-    assert_eq!(listed["latest_table_version"], 1);
-    assert_eq!(listed["commits"].as_array().expect("commits").len(), 2);
+    assert_eq!(
+        listed.get("latest_table_version").and_then(Value::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        listed
+            .get("commits")
+            .and_then(Value::as_array)
+            .expect("commits")
+            .len(),
+        2
+    );
     assert!(
         catalog
             .head_raw(&paths.coordinator_state())
@@ -295,8 +318,9 @@ async fn assert_allocated_pin(
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{described}");
-    let snapshot = described["input_identity"]["snapshot_id"]
-        .as_str()
+    let snapshot = described
+        .pointer("/input_identity/snapshot_id")
+        .and_then(Value::as_str)
         .expect("pin");
     let (status, read) = post_json(
         &serving,
@@ -306,6 +330,16 @@ async fn assert_allocated_pin(
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{read}");
-    assert_eq!(read["input_identity"]["snapshot_id"], snapshot);
-    assert_eq!(read["objects"].as_array().expect("log and data").len(), 2);
+    assert_eq!(
+        read.pointer("/input_identity/snapshot_id")
+            .and_then(Value::as_str),
+        Some(snapshot)
+    );
+    assert_eq!(
+        read.get("objects")
+            .and_then(Value::as_array)
+            .expect("log and data")
+            .len(),
+        2
+    );
 }

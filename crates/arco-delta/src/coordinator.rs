@@ -96,19 +96,12 @@ impl DeltaCommitCoordinator {
         }
     }
 
-    /// Selects the separate analytical storage for this table's immutable log.
-    ///
-    /// Coordinator state, idempotency records and staged intents stay in catalog storage.
-    /// # Errors
-    /// Returns an error when the supplied storage belongs to another authority scope.
-    pub fn with_log_storage(mut self, log_storage: ScopedStorage) -> Result<Self> {
-        if log_storage.scope() != self.storage.scope() {
-            return Err(DeltaError::bad_request(
-                "Delta log and coordinator scopes differ",
-            ));
-        }
+    /// Uses a separately resolved analytical store for the canonical Delta log.
+    /// Coordinator state, stages, and commit receipts stay in catalog storage.
+    #[must_use]
+    pub fn with_log_storage(mut self, log_storage: ScopedStorage) -> Self {
         self.log_storage = log_storage;
-        Ok(self)
+        self
     }
 
     /// Sets coordinator configuration.
@@ -260,12 +253,12 @@ impl DeltaCommitCoordinator {
         Self::require_record_root(&self.paths, &record)?;
         let path = &record.delta_log_path;
         let meta = self
-            .storage
+            .log_storage
             .head_raw(path)
             .await?
             .filter(|meta| meta.size > 0 && meta.size <= MAX_OWNER_REPLACEMENT_LOG_BYTES)
             .ok_or_else(|| DeltaError::conflict("owner replacement log is unavailable"))?;
-        let payload = self.storage.get_range(path, 0..meta.size).await?;
+        let payload = self.log_storage.get_range(path, 0..meta.size).await?;
         self.verify_replacement_record(key, record.version, &payload, &record)?;
         if recover {
             self.ensure_root_authority().await?;

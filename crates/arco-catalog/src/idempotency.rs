@@ -90,8 +90,6 @@ pub enum CatalogOperation {
     CreateSchema,
     /// Register a table within a schema.
     RegisterTableInSchema,
-    /// Allocate an Arco-owned managed Delta table within a schema.
-    AllocateManagedDeltaTable,
 }
 
 impl CatalogOperation {
@@ -104,7 +102,6 @@ impl CatalogOperation {
             Self::CreateCatalog => "create_catalog",
             Self::CreateSchema => "create_schema",
             Self::RegisterTableInSchema => "register_table_in_schema",
-            Self::AllocateManagedDeltaTable => "allocate_managed_delta_table",
         }
     }
 }

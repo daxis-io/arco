@@ -200,26 +200,3 @@ fn rejects_invalid_table_location_paths() {
         .is_err()
     );
 }
-#[test]
-fn managed_delta_root_binds_bucket_prefix_and_workspace() {
-    use arco_core::flow_paths::ManagedDeltaRoot;
-    let root = ManagedDeltaRoot::parse("s3://analytical/restricted/data").unwrap();
-    let table_id = Uuid::from_u128(42);
-    let location = root
-        .table_location("tenant1", "workspace1", table_id)
-        .unwrap();
-    assert_eq!(
-        location,
-        format!(
-            "s3://analytical/restricted/data/tenant=tenant1/workspace=workspace1/tables/{table_id}"
-        )
-    );
-    assert_ne!(
-        location,
-        root.table_location("tenant1", "workspace2", table_id)
-            .unwrap()
-    );
-    assert!(ManagedDeltaRoot::parse("s3://analytical/restricted/../escape").is_err());
-    assert!(ManagedDeltaRoot::parse("s3://analytical/restricted%2fother").is_err());
-    assert!(ManagedDeltaRoot::parse("gs://analytical/restricted").is_err());
-}

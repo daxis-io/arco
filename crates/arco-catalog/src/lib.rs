@@ -89,6 +89,7 @@ pub mod governance;
 pub mod idempotency;
 pub mod identity;
 pub mod lock;
+pub mod managed_delta;
 pub mod manifest;
 pub mod metastore;
 pub mod metrics;
@@ -178,8 +179,8 @@ pub use tier1_writer::Tier1Writer;
 pub use write_options::{IdempotencyKey, SnapshotVersion, WriteOptions};
 pub use writer::{
     Catalog, CatalogPatch, CatalogWriter, Column, ColumnDefinition, EventSource, LineageEdge,
-    ManagedDeltaAllocationRequest, Namespace, RegisterTableInSchemaRequest, RegisterTableRequest,
-    Schema, SchemaPatch, Table, TablePatch,
+    Namespace, RegisterTableInSchemaRequest, RegisterTableRequest, Schema, SchemaPatch, Table,
+    TablePatch,
 };
 
 /// Creates a publish permit issuer for sync compaction.

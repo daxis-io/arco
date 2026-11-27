@@ -11,6 +11,7 @@ use axum::http::StatusCode;
 use axum::routing::get;
 
 use arco_catalog::authz::privileges::Privilege;
+use arco_catalog::managed_delta::resolve_analytical_storage;
 use arco_core::error::Error as CoreError;
 use arco_core::storage::{StorageBackend as _, WritePrecondition, WriteResult};
 use arco_core::{DeltaPaths, ScopedStorage};
@@ -25,7 +26,7 @@ use uuid::Uuid;
 use crate::context::UnityCatalogRequestContext;
 use crate::error::{UnityCatalogError, UnityCatalogErrorResponse, UnityCatalogResult};
 use crate::routes::common;
-use crate::state::{ManagedDeltaStorage, UnityCatalogState};
+use crate::state::UnityCatalogState;
 
 /// Delta commit route group.
 pub fn routes() -> Router<UnityCatalogState> {
@@ -87,19 +88,6 @@ struct DeltaPreviewBackfillState {
     latest_backfilled_version: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     table_uri: Option<String>,
-}
-
-struct DeltaPreviewTable {
-    paths: DeltaPaths,
-    logs: ScopedStorage,
-}
-
-impl DeltaPreviewTable {
-    fn coordinator(&self, storage: &ScopedStorage) -> UnityCatalogResult<DeltaCommitCoordinator> {
-        DeltaCommitCoordinator::with_paths(storage.clone(), self.paths.clone())
-            .with_log_storage(self.logs.clone())
-            .map_err(map_delta_error)
-    }
 }
 
 const BACKFILL_STATE_CAS_RETRIES: usize = 16;
@@ -166,6 +154,18 @@ async fn reject_event_stream_target(
     Ok(())
 }
 
+struct DeltaTarget {
+    paths: DeltaPaths,
+    log_storage: ScopedStorage,
+}
+
+impl DeltaTarget {
+    fn coordinator(&self, catalog: &ScopedStorage) -> DeltaCommitCoordinator {
+        DeltaCommitCoordinator::with_paths(catalog.clone(), self.paths.clone())
+            .with_log_storage(self.log_storage.clone())
+    }
+}
+
 async fn require_catalog_managed_delta_table(
     state: &UnityCatalogState,
     ctx: &UnityCatalogRequestContext,
@@ -173,7 +173,7 @@ async fn require_catalog_managed_delta_table(
     table_id: Uuid,
     table_uri: &str,
     privilege: Privilege,
-) -> UnityCatalogResult<DeltaPreviewTable> {
+) -> UnityCatalogResult<DeltaTarget> {
     reject_event_stream_target(state, ctx, storage, table_id).await?;
     let table_id_text = table_id.to_string();
     let reader = common::authoritative_catalog_reader(state, ctx)
@@ -224,34 +224,27 @@ async fn require_catalog_managed_delta_table(
     if location != table_uri {
         return Err(table_uri_mismatch_error(table_id));
     }
-    if let Some(logs) = ManagedDeltaStorage::for_table(
-        state.managed_delta_storage.as_deref(),
-        storage,
-        &table,
-        table_id,
-    )
-    .map_err(|_| UnityCatalogError::Conflict {
-        message: "managed Delta analytical root binding changed".to_string(),
-    })? {
-        return Ok(DeltaPreviewTable {
-            paths: DeltaPaths::legacy(table_id),
-            logs,
-        });
-    }
 
-    let paths =
+    let analytical =
+        resolve_analytical_storage(state.managed_delta_storage.as_ref(), storage, &table)
+            .await
+            .map_err(common::map_catalog_error)?;
+    let paths = if analytical.is_some() {
+        DeltaPaths::legacy(table_id)
+    } else {
         DeltaPaths::from_table_location(table_id, Some(location), &ctx.tenant, &ctx.workspace)
             .map_err(|_| UnityCatalogError::BadRequest {
                 message: "registered Delta table location is invalid".to_string(),
-            })?;
+            })?
+    };
     if let Some(root_table_id) = paths.canonical_root_table_id()
         && root_table_id != table_id
     {
         reject_event_stream_target(state, ctx, storage, root_table_id).await?;
     }
-    Ok(DeltaPreviewTable {
+    Ok(DeltaTarget {
         paths,
-        logs: storage.clone(),
+        log_storage: analytical.unwrap_or_else(|| storage.clone()),
     })
 }
 
@@ -592,8 +585,7 @@ fn parse_commit_info_from_payload(version: i64, payload: &[u8]) -> DeltaCommitIn
 
 async fn preview_finalized_version(
     coordinator: &DeltaCommitCoordinator,
-    storage: &ScopedStorage,
-    paths: &DeltaPaths,
+    target: &DeltaTarget,
 ) -> UnityCatalogResult<Option<i64>> {
     if let Some(state) = coordinator
         .state_for_root()
@@ -602,8 +594,9 @@ async fn preview_finalized_version(
     {
         return Ok(Some(state.latest_version));
     }
-    let existing = storage
-        .list_page_meta(&paths.delta_log_prefix(), None, 1)
+    let existing = target
+        .log_storage
+        .list_page_meta(&target.paths.delta_log_prefix(), None, 1)
         .await
         .map_err(|err| map_internal_error("check for uncoordinated Delta logs", err))?;
     if !existing.objects.is_empty() || existing.next_start_after.is_some() {
@@ -738,8 +731,8 @@ pub(crate) async fn get_delta_preview_commits(
         Privilege::Select,
     )
     .await?;
-    let coordinator = target.coordinator(&storage)?;
-    let finalized = preview_finalized_version(&coordinator, &target.logs, &target.paths).await?;
+    let coordinator = target.coordinator(&storage);
+    let finalized = preview_finalized_version(&coordinator, &target).await?;
     let backfill_state = load_backfill_state(&storage, table_id).await?;
     if finalized.is_none() && backfill_state.is_none() {
         return Err(UnityCatalogError::NotFound {
@@ -760,7 +753,7 @@ pub(crate) async fn get_delta_preview_commits(
         .max(backfilled.map_or(0, |version| version.saturating_add(1)));
 
     let commits = list_commits(
-        &target.logs,
+        &target.log_storage,
         &target.paths,
         start,
         end_version,
@@ -779,7 +772,7 @@ pub(crate) async fn get_delta_preview_commits(
 async fn handle_commit_registration(
     storage: &ScopedStorage,
     ctx: &UnityCatalogRequestContext,
-    target: &DeltaPreviewTable,
+    target: &DeltaTarget,
     table_uri: &str,
     commit_info: DeltaCommitInfo,
     metadata: Option<&Value>,
@@ -796,8 +789,8 @@ async fn handle_commit_registration(
             })?;
     validate_idempotency_key(&idempotency_key)?;
 
-    let coordinator = target.coordinator(storage)?;
-    let finalized = preview_finalized_version(&coordinator, &target.logs, &target.paths).await?;
+    let coordinator = target.coordinator(storage);
+    let finalized = preview_finalized_version(&coordinator, target).await?;
     let backfill_state = load_backfill_state(storage, table_id).await?;
     let expected_uri = backfill_state
         .as_ref()
@@ -875,7 +868,7 @@ async fn handle_commit_registration(
 
 async fn handle_backfill_registration(
     storage: &ScopedStorage,
-    target: &DeltaPreviewTable,
+    target: &DeltaTarget,
     table_uri: &str,
     backfilled: i64,
 ) -> UnityCatalogResult<()> {
@@ -886,8 +879,8 @@ async fn handle_backfill_registration(
     }
 
     let table_id = target.paths.table_id();
-    let coordinator = target.coordinator(storage)?;
-    let finalized = preview_finalized_version(&coordinator, &target.logs, &target.paths).await?;
+    let coordinator = target.coordinator(storage);
+    let finalized = preview_finalized_version(&coordinator, target).await?;
     let backfill_state = load_backfill_state(storage, table_id).await?;
     if finalized.is_none() && backfill_state.is_none() {
         return Err(UnityCatalogError::NotFound {

@@ -1560,34 +1560,86 @@
     "/api/v1/managed-delta/ensure": {
       "post": {
         "tags": [
-          "catalogs"
+          "Delta"
         ],
-        "summary": "Allocates a managed Delta table for a principal with schema CREATE_TABLE.",
-        "description": "# Errors\nReturns an error on denied allocation, invalid intent, or catalog failure.",
-        "operationId": "ensure",
+        "operationId": "ensure_managed_delta",
         "requestBody": {
+          "description": "UUIDv7 operation_id, authenticated owner, and provisioning_fingerprint",
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/AllocateManagedDeltaRequest"
+                "type": "object"
               }
             }
           },
           "required": true
         },
         "responses": {
-          "201": {
-            "description": "Arco-owned placement allocated or replayed",
+          "200": {
+            "description": "Allocated managed Delta fixture or identical replay"
+          },
+          "400": {
+            "description": "Invalid allocation intent"
+          },
+          "401": {
+            "description": "Missing or invalid authentication"
+          },
+          "403": {
+            "description": "Allocation privilege or managed root denied"
+          },
+          "409": {
+            "description": "Intent or table incarnation conflict"
+          },
+          "503": {
+            "description": "Approved analytical storage or governance unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/managed-delta/storage": {
+      "post": {
+        "tags": [
+          "Delta"
+        ],
+        "operationId": "probe_managed_delta_storage",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ManagedDeltaStorageProbeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Analytical storage access verified",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ManagedDeltaAllocationResponse"
+                  "$ref": "#/components/schemas/ManagedDeltaStorageProbeResponse"
                 }
               }
             }
           },
           "400": {
-            "description": "Invalid intent",
+            "description": "Invalid operation identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid authentication",
             "content": {
               "application/json": {
                 "schema": {
@@ -1597,7 +1649,7 @@
             }
           },
           "403": {
-            "description": "Schema CREATE_TABLE required",
+            "description": "Allocation privilege or managed root denied",
             "content": {
               "application/json": {
                 "schema": {
@@ -1606,8 +1658,8 @@
               }
             }
           },
-          "404": {
-            "description": "Allocation unavailable or schema absent",
+          "500": {
+            "description": "Storage access or integrity check failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -1616,8 +1668,8 @@
               }
             }
           },
-          "409": {
-            "description": "Operation or name conflict",
+          "503": {
+            "description": "Storage unavailable or probe contention exhausted retries",
             "content": {
               "application/json": {
                 "schema": {
@@ -5011,55 +5063,6 @@
           }
         }
       },
-      "AllocateManagedDeltaRequest": {
-        "type": "object",
-        "description": "Owner intent for a table in an existing schema.",
-        "required": [
-          "operation_id",
-          "catalog",
-          "schema",
-          "name",
-          "provisioning_fingerprint",
-          "columns"
-        ],
-        "properties": {
-          "catalog": {
-            "type": "string",
-            "description": "Existing catalog."
-          },
-          "columns": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ColumnDefinition"
-            },
-            "description": "Columns in schema order."
-          },
-          "description": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Optional table description."
-          },
-          "name": {
-            "type": "string",
-            "description": "Logical table name."
-          },
-          "operation_id": {
-            "type": "string",
-            "description": "`UUIDv7` reused for identical retries."
-          },
-          "provisioning_fingerprint": {
-            "type": "string",
-            "description": "Fingerprint of the client's provisioning intent."
-          },
-          "schema": {
-            "type": "string",
-            "description": "Existing schema."
-          }
-        },
-        "additionalProperties": false
-      },
       "ApiErrorBody": {
         "type": "object",
         "description": "Standard JSON error response body.",
@@ -6749,57 +6752,28 @@
           }
         }
       },
-      "ManagedDeltaAllocationResponse": {
+      "ManagedDeltaStorageProbeRequest": {
         "type": "object",
-        "description": "Catalog-verified placement returned to the owner.",
         "required": [
-          "id",
-          "catalog",
-          "schema",
-          "name",
-          "location",
-          "table_type",
-          "format",
-          "properties"
+          "operation_id"
         ],
         "properties": {
-          "catalog": {
+          "operation_id": {
             "type": "string",
-            "description": "Catalog of the allocated table."
-          },
-          "format": {
+            "description": "Original UUIDv7 operation identity."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ManagedDeltaStorageProbeResponse": {
+        "type": "object",
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "state": {
             "type": "string",
-            "description": "Always `delta` for this operation."
-          },
-          "id": {
-            "type": "string",
-            "description": "Arco-selected table UUID."
-          },
-          "location": {
-            "type": "string",
-            "description": "Approved analytical storage URI."
-          },
-          "name": {
-            "type": "string",
-            "description": "Table name."
-          },
-          "properties": {
-            "type": "object",
-            "description": "Persisted root, owner, schema digest and provisioning fingerprint.",
-            "additionalProperties": {
-              "type": "string"
-            },
-            "propertyNames": {
-              "type": "string"
-            }
-          },
-          "schema": {
-            "type": "string",
-            "description": "Schema of the allocated table."
-          },
-          "table_type": {
-            "type": "string",
-            "description": "Always `MANAGED` for this operation."
+            "description": "Passed after the scoped write, metadata read, payload read, and cleanup."
           }
         }
       },

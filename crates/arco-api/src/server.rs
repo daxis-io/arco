@@ -31,8 +31,8 @@ use arco_storage::{StorageProvider, provider_for_bucket};
 use arco_uc::context::UnityCatalogRequestContext;
 use arco_uc::error::UnityCatalogError;
 use arco_uc::{
-    CompiledPermissionSource, ManagedDeltaStorage, MetastorePermissionSource, UnityCatalogState,
-    event_stream_router, unity_catalog_router,
+    CompiledPermissionSource, MetastorePermissionSource, UnityCatalogState, event_stream_router,
+    unity_catalog_router,
 };
 
 use crate::compactor_client::CompactorClient;
@@ -135,9 +135,9 @@ pub struct AppState {
     pub config: Config,
     /// Storage backend for tenant data.
     storage: Arc<dyn arco_core::storage::StorageBackend>,
-    pub(crate) managed_delta_storage: Option<Arc<ManagedDeltaStorage>>,
     /// Authoritative catalog permissions shared by the native and UC routers.
     pub(crate) catalog_permissions: Arc<dyn CompiledPermissionSource>,
+    pub(crate) managed_delta_storage: Option<arco_catalog::managed_delta::ManagedDeltaStorage>,
     /// Rate limiting state (shared across tenants).
     rate_limit: Arc<RateLimitState>,
     /// Sync compaction client (Tier-1 DDL).
@@ -155,11 +155,11 @@ impl std::fmt::Debug for AppState {
         f.debug_struct("AppState")
             .field("config", &self.config)
             .field("storage", &"<StorageBackend>")
+            .field("catalog_permissions", &"<CompiledPermissionSource>")
             .field(
                 "managed_delta_storage",
                 &self.managed_delta_storage.is_some(),
             )
-            .field("catalog_permissions", &"<CompiledPermissionSource>")
             .field("rate_limit", &"<RateLimitState>")
             .field("sync_compactor", &self.sync_compactor.is_some())
             .field("sensor_evaluator", &"<SensorEvaluator>")
@@ -216,8 +216,8 @@ impl AppState {
         Self {
             config,
             catalog_permissions: Arc::new(MetastorePermissionSource::new(Arc::clone(&storage))),
-            storage,
             managed_delta_storage: None,
+            storage,
             rate_limit,
             sync_compactor,
             sensor_evaluator,
@@ -764,7 +764,6 @@ fn insert_retry_after(headers: &mut HeaderMap, retry_after_secs: u64) {
 pub struct Server {
     config: Config,
     storage: Arc<dyn arco_core::storage::StorageBackend>,
-    managed_delta_storage: Option<Arc<ManagedDeltaStorage>>,
     sensor_evaluator: Arc<dyn SensorEvaluator>,
     audit_emitter: Option<Arc<AuditEmitter>>,
 }
@@ -774,10 +773,6 @@ impl std::fmt::Debug for Server {
         f.debug_struct("Server")
             .field("config", &self.config)
             .field("storage", &"<StorageBackend>")
-            .field(
-                "managed_delta_storage",
-                &self.managed_delta_storage.is_some(),
-            )
             .field("sensor_evaluator", &"<SensorEvaluator>")
             .field("audit_emitter", &self.audit_emitter.is_some())
             .finish()
@@ -793,7 +788,6 @@ impl Server {
         Self {
             config,
             storage: Arc::new(arco_core::storage::MemoryBackend::new()),
-            managed_delta_storage: None,
             sensor_evaluator: Arc::new(NoopSensorEvaluator),
             audit_emitter: None,
         }
@@ -808,7 +802,6 @@ impl Server {
         Self {
             config,
             storage,
-            managed_delta_storage: None,
             sensor_evaluator: Arc::new(NoopSensorEvaluator),
             audit_emitter: None,
         }
@@ -820,28 +813,14 @@ impl Server {
         ServerBuilder::new()
     }
 
-    /// Supplies the analytical backend for the configured managed Delta root.
-    #[must_use]
-    pub fn with_managed_delta_storage(mut self, binding: ManagedDeltaStorage) -> Self {
-        self.managed_delta_storage = Some(Arc::new(binding));
-        self
-    }
-
     /// Returns the server configuration.
     #[must_use]
     pub fn config(&self) -> &Config {
         &self.config
     }
 
-    #[allow(
-        clippy::expect_used,
-        reason = "serve validates the exact-root binding configuration before constructing state; test_router treats invalid fixture configuration as a test bug"
-    )]
-    fn create_state(&self) -> Arc<AppState> {
-        let bindings = self
-            .config
-            .catalog_authority_bindings()
-            .expect("server configuration must validate before state construction");
+    fn create_state(&self) -> Result<Arc<AppState>> {
+        let bindings = self.config.catalog_authority_bindings()?;
         let mut state = AppState::new_with_audit(
             self.config.clone(),
             Arc::clone(&self.storage),
@@ -849,10 +828,19 @@ impl Server {
             self.audit_emitter.clone(),
         )
         .with_catalog_authority_bindings(Arc::new(bindings));
-        state
-            .managed_delta_storage
-            .clone_from(&self.managed_delta_storage);
-        Arc::new(state)
+        state.managed_delta_storage = self
+            .config
+            .storage
+            .managed_delta_root
+            .as_deref()
+            .map(|root| {
+                arco_catalog::managed_delta::ManagedDeltaStorage::open(
+                    root,
+                    arco_storage::from_bucket,
+                )
+            })
+            .transpose()?;
+        Ok(Arc::new(state))
     }
 
     /// Creates the router with all routes and middleware.
@@ -1011,13 +999,10 @@ impl Server {
                 event_streams,
                 ..arco_uc::UnityCatalogConfig::default()
             };
-            let mut uc_state =
-                UnityCatalogState::with_config(Arc::clone(&state.storage), uc_config)
-                    .with_catalog_authority_bindings(state.catalog_authority_bindings())
-                    .with_permission_source(Arc::clone(&state.catalog_permissions));
-            uc_state
-                .managed_delta_storage
-                .clone_from(&state.managed_delta_storage);
+            let uc_state = UnityCatalogState::with_config(Arc::clone(&state.storage), uc_config)
+                .with_catalog_authority_bindings(state.catalog_authority_bindings())
+                .with_managed_delta_storage(state.managed_delta_storage.clone())
+                .with_permission_source(Arc::clone(&state.catalog_permissions));
 
             if events_enabled {
                 let event_service = ServiceBuilder::new()
@@ -1203,7 +1188,7 @@ impl Server {
             None
         };
 
-        let state = self.create_state();
+        let state = self.create_state()?;
         let http_addr = SocketAddr::from(([0, 0, 0, 0], self.config.http_port));
         let grpc_addr = SocketAddr::from(([0, 0, 0, 0], self.config.grpc_port));
         let router = self.create_router(Arc::clone(&state), credential_provider);
@@ -1262,30 +1247,20 @@ impl Server {
     /// using this server's configured storage backend (default: in-memory).
     /// Credential vending is disabled in test mode.
     #[doc(hidden)]
+    #[allow(
+        clippy::expect_used,
+        reason = "invalid fixture configuration is a test bug"
+    )]
     pub fn test_router(&self) -> Router {
-        let state = self.create_state();
+        let state = self
+            .create_state()
+            .expect("valid server fixture configuration");
         self.create_router(state, None)
     }
 
     #[allow(clippy::too_many_lines)]
     fn validate_config(&self) -> Result<()> {
         self.config.catalog_authority_bindings()?;
-        let managed_delta_root = self
-            .config
-            .managed_delta_root
-            .as_deref()
-            .map(arco_core::flow_paths::ManagedDeltaRoot::parse)
-            .transpose()?;
-        if managed_delta_root.as_ref()
-            != self
-                .managed_delta_storage
-                .as_ref()
-                .map(|storage| storage.root())
-        {
-            return Err(arco_core::Error::InvalidInput(
-                "managed Delta root requires its exact configured analytical backend".to_string(),
-            ));
-        }
         self.config.event_stream_bindings()?;
 
         if !self.config.posture.is_dev() && self.config.debug {
@@ -1519,7 +1494,6 @@ impl ServerBuilder {
         Server {
             config: self.config,
             storage: self.storage,
-            managed_delta_storage: None,
             sensor_evaluator: self.sensor_evaluator,
             audit_emitter: self.audit_emitter,
         }

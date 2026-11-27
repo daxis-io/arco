@@ -6,7 +6,6 @@ pub mod catalogs;
 pub mod control_store;
 pub mod delta;
 pub mod lineage;
-pub(crate) mod managed_delta;
 pub mod manifests;
 pub mod namespaces;
 pub mod orchestration;
@@ -30,7 +29,6 @@ pub fn api_v1_routes() -> Router<Arc<AppState>> {
         .merge(lineage::routes())
         .merge(browser::routes())
         .merge(delta::routes())
-        .merge(managed_delta::routes())
         .merge(orchestration::routes())
         .merge(transactions::routes())
         .merge(manifests::routes())

@@ -212,10 +212,6 @@ pub struct Config {
     #[serde(default)]
     pub storage: StorageConfig,
 
-    /// Approved S3 bucket and key prefix for owner-allocated Delta tables.
-    #[serde(default)]
-    pub managed_delta_root: Option<String>,
-
     /// Compactor base URL for sync compaction (e.g., `<http://compactor:8081>`).
     #[serde(default)]
     pub compactor_url: Option<String>,
@@ -421,7 +417,6 @@ impl Default for Config {
             task_token: TaskTokenConfig::default(),
             rate_limit: RateLimitConfig::default(),
             storage: StorageConfig::default(),
-            managed_delta_root: None,
             compactor_url: None,
             compactor_auth: CompactorAuthConfig::default(),
             orchestration_compactor_url: None,
@@ -601,6 +596,9 @@ pub struct StorageConfig {
     /// In GCS deployments this is injected via Terraform as `ARCO_STORAGE_BUCKET`.
     #[serde(default)]
     pub bucket: Option<String>,
+    /// Approved S3 bucket and prefix for Arco-owned managed Delta allocations.
+    #[serde(default)]
+    pub managed_delta_root: Option<String>,
 }
 
 impl Config {
@@ -756,7 +754,7 @@ impl Config {
         if let Some(bucket) = env_string("ARCO_STORAGE_BUCKET") {
             config.storage.bucket = Some(bucket);
         }
-        config.managed_delta_root = env_string("ARCO_MANAGED_DELTA_ROOT");
+        config.storage.managed_delta_root = env_string("ARCO_MANAGED_DELTA_ROOT");
         if let Some(url) = env_string("ARCO_COMPACTOR_URL") {
             config.compactor_url = Some(url);
         }

@@ -68,19 +68,24 @@ def read_snapshot(descriptor, bundle):
         assert table.metadata().id == identity["delta_table_id"]
         active_files = sorted(str(Path(path).relative_to(root)) for path in table.file_uris())
         assert set(active_files) == files.keys() - logs
-        rows = table.to_pyarrow_table(filters=[
-            ("status", "=", "paid"),
-            ("day", ">=", date(2026, 1, 1)),
-            ("day", "<", date(2026, 2, 1)),
-        ])
-        assert set(rows["day"].to_pylist()) == {date(2026, 1, 1)}
+        if [field["name"] for field in descriptor["schema"]] == ["id", "amount"]:
+            rows = table.to_pyarrow_table()
+            amount_column = "amount"
+        else:
+            rows = table.to_pyarrow_table(filters=[
+                ("status", "=", "paid"),
+                ("day", ">=", date(2026, 1, 1)),
+                ("day", "<", date(2026, 2, 1)),
+            ])
+            assert set(rows["day"].to_pylist()) == {date(2026, 1, 1)}
+            amount_column = "amount_cents"
         return {
             "table_id": identity["table_id"],
             "snapshot_id": identity["snapshot_id"],
             "delta_table_id": table.metadata().id,
             "delta_version": table.version(),
             "active_files": active_files,
-            "total_cents": sum(rows["amount_cents"].to_pylist()),
+            "total_cents": sum(rows[amount_column].to_pylist()),
             "order_count": rows.num_rows,
         }
 

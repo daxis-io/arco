@@ -11,10 +11,80 @@ use arco_catalog::metastore::publish::PublishedStorageGovernanceCache;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::context::UnityCatalogRequestContext;
+use crate::error::{UnityCatalogError, UnityCatalogResult};
 use crate::event_streams::EventStreamBindings;
 use crate::permissions::CompiledPermissionSource;
 use arco_core::audit::AuditEmitter;
 use arco_core::storage::StorageBackend;
+use arco_core::{ControlPlaneScope, Error, Result};
+
+/// An operator-approved bounded inventory of whole-table reads in one workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernedCatalogReadConfig {
+    /// Exact authenticated tenant ID.
+    pub tenant_id: String,
+    /// Exact authenticated workspace ID.
+    pub workspace_id: String,
+    /// Stable IDs of tables approved for whole-table delivery.
+    pub table_ids: Vec<String>,
+}
+
+impl GovernedCatalogReadConfig {
+    /// Validates the exact scope and bounded table inventory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid scope, inventory size, or table ID.
+    pub fn validate(&self) -> Result<()> {
+        ControlPlaneScope::workspace_alias(&self.tenant_id, &self.workspace_id)?;
+        if self.table_ids.is_empty() || self.table_ids.len() > 64 {
+            return Err(Error::InvalidInput(
+                "governed catalog read requires between 1 and 64 table IDs".to_string(),
+            ));
+        }
+        let mut unique = std::collections::BTreeSet::new();
+        for id in &self.table_ids {
+            if !Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == *id) || !unique.insert(id)
+            {
+                return Err(Error::InvalidInput(
+                    "governed catalog read requires distinct canonical table UUIDs".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn require_scope(&self, ctx: &UnityCatalogRequestContext) -> UnityCatalogResult<()> {
+        if ctx.tenant != self.tenant_id || ctx.workspace != self.workspace_id {
+            return Err(catalog_read_denied());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn admits(&self, table_id: &str) -> bool {
+        self.table_ids.iter().any(|id| id == table_id)
+    }
+
+    pub(crate) fn require_table(
+        &self,
+        ctx: &UnityCatalogRequestContext,
+        table_id: &str,
+    ) -> UnityCatalogResult<()> {
+        self.require_scope(ctx)?;
+        if !self.admits(table_id) {
+            return Err(catalog_read_denied());
+        }
+        Ok(())
+    }
+}
+
+fn catalog_read_denied() -> UnityCatalogError {
+    UnityCatalogError::Forbidden {
+        message: "governed_catalog_access_denied".to_string(),
+    }
+}
 
 /// Operator-approved activity tables keyed by `tenant/workspace`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

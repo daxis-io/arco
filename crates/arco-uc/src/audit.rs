@@ -2,7 +2,9 @@
 
 use crate::context::UnityCatalogRequestContext;
 use crate::state::UnityCatalogState;
+use arco_catalog::credential_vending::CredentialVendingDecision;
 use arco_core::audit::{AuditAction, AuditEvent};
+use sha2::{Digest, Sha256};
 
 /// Authz allow reason.
 pub const REASON_PERMISSIONS_ALLOW: &str = "permissions_allow";
@@ -13,8 +15,11 @@ pub const REASON_CREDENTIALS_VENDED: &str = "credentials_vended";
 /// Credential vending deny reason.
 pub const REASON_CREDENTIALS_DENIED: &str = "credentials_denied";
 
-fn actor_from_ctx(ctx: &UnityCatalogRequestContext) -> &str {
-    ctx.user_id.as_deref().unwrap_or("anonymous")
+fn actor_from_ctx(ctx: &UnityCatalogRequestContext) -> String {
+    ctx.user_id.as_deref().map_or_else(
+        || "anonymous".to_string(),
+        |id| format!("user:{}", hex::encode(Sha256::digest(id))),
+    )
 }
 
 fn emit_event(
@@ -97,11 +102,37 @@ pub fn emit_credentials_deny(
     resource: &str,
     reason: &str,
 ) {
-    emit_event(
-        state,
-        ctx,
-        AuditAction::CredVendDeny,
-        resource.to_string(),
-        reason,
-    );
+    let resource = if resource.contains("://") {
+        format!("path:{}", hex::encode(Sha256::digest(resource)))
+    } else {
+        resource.to_string()
+    };
+    emit_event(state, ctx, AuditAction::CredVendDeny, resource, reason);
+}
+
+pub(crate) fn emit_table_read_allow(
+    state: &UnityCatalogState,
+    ctx: &UnityCatalogRequestContext,
+    table_id: &str,
+    snapshot_id: &str,
+    permission_watermark: &str,
+    decision: &CredentialVendingDecision,
+) {
+    let Some(emitter) = state.audit_emitter.as_ref() else {
+        return;
+    };
+    if let Ok(mut event) = AuditEvent::builder()
+        .action(AuditAction::AuthAllow)
+        .actor(actor_from_ctx(ctx))
+        .tenant_id(&ctx.tenant)
+        .workspace_id(&ctx.workspace)
+        .resource(format!("uc_table_read:{table_id}:{snapshot_id}"))
+        .decision_reason(&decision.reason_code)
+        .policy_version(permission_watermark)
+        .request_id(&ctx.request_id)
+        .try_build()
+    {
+        event.event_id.clone_from(&decision.audit_event_id);
+        emitter.emit(event);
+    }
 }

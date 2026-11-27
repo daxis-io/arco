@@ -146,11 +146,13 @@ async fn disclose_snapshot(
             message: "table_read_snapshot_mismatch".to_string(),
         });
     }
-    audit::emit_credentials_allow(
+    audit::emit_table_read_allow(
         state,
         ctx,
-        &root.uri,
-        &final_authorization.decision.reason_code,
+        table_id,
+        &snapshot_id,
+        &final_authorization.observed.published.ledger_watermark,
+        &final_authorization.decision,
     );
 
     match disclosure {

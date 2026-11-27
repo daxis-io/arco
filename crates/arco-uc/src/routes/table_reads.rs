@@ -4,8 +4,10 @@
 //! Both profiles reuse UC credential authorization and fence disclosure.
 
 pub(super) mod delta;
+mod discovery;
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use arco_catalog::authz::privileges::Privilege;
 use arco_catalog::credential_vending::{CredentialOperation, DEFAULT_CREDENTIAL_TTL};
@@ -30,11 +32,13 @@ use sha2::{Digest, Sha256};
 use crate::audit;
 use crate::context::UnityCatalogRequestContext;
 use crate::error::{UnityCatalogError, UnityCatalogResult};
-use crate::routes::common::{catalog_authority, map_catalog_error, scoped_storage};
+use crate::routes::common::{authoritative_catalog_reader, map_catalog_error, scoped_storage};
 use crate::routes::credentials::{
     authorize_path_access, authorize_table_access, revalidate_observed_watermark,
 };
-use crate::state::UnityCatalogState;
+use crate::state::{GovernedCatalogReadConfig, UnityCatalogState};
+
+pub(crate) use discovery::discovery_routes;
 
 const MAX_TABLE_READ_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TABLE_READ_REQUEST_BYTES: usize = 1024;
@@ -93,8 +97,12 @@ async fn post_table_read(
     State(state): State<UnityCatalogState>,
     Extension(ctx): Extension<UnityCatalogRequestContext>,
     Path(table_id): Path<String>,
+    profile: Option<Extension<Arc<GovernedCatalogReadConfig>>>,
     request: Request,
 ) -> UnityCatalogResult<Response> {
+    if let Some(Extension(profile)) = &profile {
+        profile.require_table(&ctx, &table_id)?;
+    }
     let request = parse_table_read_request(request).await?;
     if let Some(version) = request.delta_version {
         return delta::respond(
@@ -106,6 +114,11 @@ async fn post_table_read(
             delta::Disclosure::Bundle,
         )
         .await;
+    }
+    if profile.is_some() && request.expected_snapshot_id.is_none() {
+        return Err(UnityCatalogError::BadRequest {
+            message: "table_read_pin_required".to_string(),
+        });
     }
 
     let read = authorized_table_read(&state, &ctx, &table_id, request).await?;
@@ -129,8 +142,12 @@ async fn post_table_descriptor(
     State(state): State<UnityCatalogState>,
     Extension(ctx): Extension<UnityCatalogRequestContext>,
     Path(table_id): Path<String>,
+    profile: Option<Extension<Arc<GovernedCatalogReadConfig>>>,
     request: Request,
 ) -> UnityCatalogResult<Response> {
+    if let Some(Extension(profile)) = profile {
+        profile.require_table(&ctx, &table_id)?;
+    }
     let request = parse_table_read_request(request).await?;
     if let Some(version) = request.delta_version {
         return delta::respond(
@@ -231,11 +248,13 @@ async fn authorized_table_read(
         }
     }
 
-    audit::emit_credentials_allow(
+    audit::emit_table_read_allow(
         state,
         ctx,
-        &object.governed_path,
-        &final_path_authorization.decision.reason_code,
+        table_id,
+        &snapshot_id,
+        &final_path_authorization.observed.published.ledger_watermark,
+        &final_path_authorization.decision,
     );
 
     Ok(AuthorizedTableRead {
@@ -301,14 +320,17 @@ pub(super) async fn load_table(
     ctx: &UnityCatalogRequestContext,
     table_id: &str,
 ) -> UnityCatalogResult<(Table, Vec<Column>)> {
-    let authority = catalog_authority(state, ctx).await?;
+    let not_found = || UnityCatalogError::NotFound {
+        message: format!("table not found: {table_id}"),
+    };
+    let authority = authoritative_catalog_reader(state, ctx)
+        .await?
+        .ok_or_else(not_found)?;
     let table = authority
         .get_table_by_id(table_id)
         .await
         .map_err(map_catalog_error)?
-        .ok_or_else(|| UnityCatalogError::NotFound {
-            message: format!("table not found: {table_id}"),
-        })?;
+        .ok_or_else(not_found)?;
     let columns = authority
         .get_columns(table_id)
         .await

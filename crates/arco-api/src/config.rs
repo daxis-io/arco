@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use arco_catalog::{CatalogAuthorityBinding, CatalogAuthorityBindings};
 pub use arco_core::TaskTokenConfig;
 use arco_core::{Error, MAX_TASK_TOKEN_TTL_SECONDS, Result};
+pub use arco_uc::GovernedCatalogReadConfig;
 
 use crate::rate_limit::RateLimitConfig;
 
@@ -255,6 +256,10 @@ pub struct Config {
     #[serde(default)]
     pub usage_bindings: arco_uc::UsageBindings,
 
+    /// Serve only governed catalog discovery and pinned table reads.
+    #[serde(default)]
+    pub governed_catalog_read: Option<GovernedCatalogReadConfig>,
+
     /// Optional exact synthetic metastore root bound to `control/v1`.
     ///
     /// Every other root remains on the legacy authority. Wildcards and lists
@@ -427,6 +432,7 @@ impl Default for Config {
             unity_catalog: UnityCatalogApiConfig::default(),
             event_streams: arco_uc::EventStreamBindings::default(),
             usage_bindings: arco_uc::UsageBindings::default(),
+            governed_catalog_read: None,
             catalog_control_v1_root: None,
             catalog_control_v1_cursor_key: None,
             audit: AuditConfig::default(),
@@ -650,6 +656,7 @@ impl Config {
     /// - `ARCO_EVENT_STREAM_BINDINGS`
     /// - `ARCO_USAGE_TABLE_BINDINGS`
     /// - `ARCO_UNITY_CATALOG_MOUNT_PREFIX`
+    /// - `ARCO_GOVERNED_CATALOG_READ` (JSON object with `tenant_id`, `workspace_id` and `table_ids`)
     /// - `ARCO_CATALOG_CONTROL_V1_TENANT_ID`
     /// - `ARCO_CATALOG_CONTROL_V1_WORKSPACE_ID`
     /// - `ARCO_CATALOG_CONTROL_V1_CURSOR_KEY`
@@ -843,6 +850,22 @@ impl Config {
         }
         if let Some(prefix) = env_string("ARCO_UNITY_CATALOG_MOUNT_PREFIX") {
             config.unity_catalog.mount_prefix = prefix;
+        }
+        match std::env::var("ARCO_GOVERNED_CATALOG_READ") {
+            Ok(value) => {
+                config.governed_catalog_read =
+                    Some(serde_json::from_str(&value).map_err(|_| {
+                        Error::InvalidInput(
+                            "ARCO_GOVERNED_CATALOG_READ must be a profile object".to_string(),
+                        )
+                    })?);
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(Error::InvalidInput(
+                    "ARCO_GOVERNED_CATALOG_READ must be valid UTF-8".to_string(),
+                ));
+            }
         }
 
         let control_tenant = env_string("ARCO_CATALOG_CONTROL_V1_TENANT_ID");

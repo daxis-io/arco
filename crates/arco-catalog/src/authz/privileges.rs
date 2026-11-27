@@ -30,6 +30,8 @@ pub enum Privilege {
     ReadFiles,
     /// Write governed files.
     WriteFiles,
+    /// Discover table metadata without permission to read table data.
+    Browse,
 }
 
 impl Privilege {
@@ -49,6 +51,7 @@ impl Privilege {
             Self::CredentialMint => "CREDENTIAL_MINT",
             Self::ReadFiles => "READ_FILES",
             Self::WriteFiles => "WRITE_FILES",
+            Self::Browse => "BROWSE",
         }
     }
 
@@ -82,6 +85,7 @@ impl FromStr for Privilege {
             "CREDENTIAL_MINT" | "CREDENTIAL MINT" => Ok(Self::CredentialMint),
             "READ_FILES" | "READ FILES" => Ok(Self::ReadFiles),
             "WRITE_FILES" | "WRITE FILES" => Ok(Self::WriteFiles),
+            "BROWSE" => Ok(Self::Browse),
             other => Err(format!("unknown privilege '{other}'")),
         }
     }

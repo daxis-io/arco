@@ -4,15 +4,16 @@ use std::collections::BTreeMap;
 
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::json;
 
 use arco_catalog::authz::privileges::Privilege;
+use arco_catalog::idempotency::validate_uuidv7;
 use arco_catalog::metastore::events::{
-    ExternalLocationRecord, LifecycleState, MetastoreEvent, MetastoreMutation,
+    ExternalLocationRecord, LifecycleState, ManagedRootRecord, MetastoreEvent, MetastoreMutation,
 };
 use arco_catalog::metastore::ledger::MetastoreLedger;
 use arco_catalog::metastore::projections::ProjectionRegistry;
@@ -21,12 +22,13 @@ use arco_catalog::metastore::publish::{
 };
 use arco_catalog::storage_governance::StorageGovernanceState;
 use arco_catalog::storage_governance::external_locations::ExternalLocation;
+use arco_catalog::storage_governance::managed_roots::ManagedRoot;
 
 use crate::context::UnityCatalogRequestContext;
 use crate::error::UnityCatalogError;
 use crate::routes::common::{
-    control_plane_scope, map_catalog_error, publish_storage_governance_projection, require_authz,
-    scoped_storage,
+    control_plane_scope, governance_mutation_view, map_catalog_error,
+    publish_storage_governance_projection, require_authz, scoped_storage,
 };
 use crate::state::UnityCatalogState;
 
@@ -48,6 +50,10 @@ pub fn routes() -> Router<UnityCatalogState> {
         )
         .route("/external-locations/:name", get(get_external_location))
         .route(
+            "/storage-governance/managed-roots/:root_id",
+            put(create_managed_root).delete(revoke_managed_root),
+        )
+        .route(
             "/storage-governance/projection/republish",
             post(republish_storage_governance_projection_route),
         )
@@ -63,7 +69,7 @@ async fn create_external_location(
     // earlier commit whose synchronous publication failed (#362).
     publish_storage_governance_projection(&state, &ctx).await?;
     let ledger = ledger(&state, &ctx)?;
-    let metastore = ledger.replay().await.map_err(map_catalog_error)?;
+    let (metastore, sequence) = governance_mutation_view(&ledger).await?;
     let mut storage_state =
         StorageGovernanceState::from_metastore_state(&metastore).map_err(map_catalog_error)?;
 
@@ -92,7 +98,7 @@ async fn create_external_location(
     let event = MetastoreEvent::new_scoped(
         &scope,
         ulid::Ulid::new().to_string(),
-        ledger.next_sequence().await.map_err(map_catalog_error)?,
+        sequence,
         MetastoreMutation::ExternalLocationUpserted(ExternalLocationRecord {
             location_id: location.location_id,
             name: location.name,
@@ -123,6 +129,125 @@ async fn create_external_location(
             Some(event.event_id.as_str()),
         )),
     ))
+}
+
+async fn create_managed_root(
+    State(state): State<UnityCatalogState>,
+    Extension(ctx): Extension<UnityCatalogRequestContext>,
+    Path(root_id): Path<String>,
+) -> Result<(StatusCode, Json<ManagedRootRecord>), UnityCatalogError> {
+    require_storage_governance_admin(&state, &ctx).await?;
+    validate_managed_root_id(&root_id)?;
+    let storage = scoped_storage(&state, &ctx)?;
+    let url = state
+        .managed_delta_storage
+        .as_ref()
+        .ok_or_else(|| UnityCatalogError::ServiceUnavailable {
+            message: "managed_delta_storage_unavailable".to_string(),
+        })?
+        .workspace_uri(&storage);
+    publish_storage_governance_projection(&state, &ctx).await?;
+    let ledger = MetastoreLedger::new(storage).map_err(map_catalog_error)?;
+    let (metastore, sequence) = governance_mutation_view(&ledger).await?;
+    if let Some(record) = metastore.managed_roots.get(&root_id) {
+        if record.lifecycle_state == LifecycleState::Active
+            && record.workspace_id == ctx.workspace
+            && record.url == url
+        {
+            return Ok((StatusCode::OK, Json(record.clone())));
+        }
+        return Err(UnityCatalogError::Conflict {
+            message: "managed_root_id_already_used".to_string(),
+        });
+    }
+    if metastore.managed_roots.values().any(|record| {
+        record.lifecycle_state == LifecycleState::Active && record.workspace_id == ctx.workspace
+    }) {
+        return Err(UnityCatalogError::Conflict {
+            message: "workspace_managed_root_already_active".to_string(),
+        });
+    }
+    let owner = ctx
+        .user_id
+        .clone()
+        .ok_or_else(|| UnityCatalogError::Forbidden {
+            message: "storage_governance_denied".to_string(),
+        })?;
+    let root = ManagedRoot::new(&root_id, "managed-delta", &ctx.workspace, &url, owner)
+        .map_err(map_catalog_error)?;
+    let mut governance =
+        StorageGovernanceState::from_metastore_state(&metastore).map_err(map_catalog_error)?;
+    let record = ManagedRootRecord {
+        url: root
+            .path
+            .persistable_canonical_uri()
+            .map_err(map_catalog_error)?,
+        root_id: root.root_id.clone(),
+        name: root.name.clone(),
+        workspace_id: root.workspace_id.clone(),
+        owner: root.owner.clone(),
+        lifecycle_state: root.lifecycle_state,
+        updated_at_ms: Utc::now().timestamp_millis(),
+        properties: BTreeMap::new(),
+    };
+    governance
+        .create_managed_root(root)
+        .map_err(map_catalog_error)?;
+    write_managed_root(&state, &ctx, &ledger, sequence, &record).await?;
+    Ok((StatusCode::CREATED, Json(record)))
+}
+
+async fn revoke_managed_root(
+    State(state): State<UnityCatalogState>,
+    Extension(ctx): Extension<UnityCatalogRequestContext>,
+    Path(root_id): Path<String>,
+) -> Result<(StatusCode, Json<ManagedRootRecord>), UnityCatalogError> {
+    require_storage_governance_admin(&state, &ctx).await?;
+    validate_managed_root_id(&root_id)?;
+    publish_storage_governance_projection(&state, &ctx).await?;
+    let ledger = ledger(&state, &ctx)?;
+    let (mut metastore, sequence) = governance_mutation_view(&ledger).await?;
+    let mut record = metastore
+        .managed_roots
+        .remove(&root_id)
+        .filter(|record| record.workspace_id == ctx.workspace)
+        .ok_or_else(|| UnityCatalogError::NotFound {
+            message: "managed_root_not_found".to_string(),
+        })?;
+    if record.lifecycle_state != LifecycleState::Deleted {
+        record.lifecycle_state = LifecycleState::Deleted;
+        record.updated_at_ms = Utc::now().timestamp_millis();
+        write_managed_root(&state, &ctx, &ledger, sequence, &record).await?;
+    }
+    Ok((StatusCode::OK, Json(record)))
+}
+
+async fn write_managed_root(
+    state: &UnityCatalogState,
+    ctx: &UnityCatalogRequestContext,
+    ledger: &MetastoreLedger,
+    sequence: u64,
+    record: &ManagedRootRecord,
+) -> Result<(), UnityCatalogError> {
+    let event = MetastoreEvent::new_scoped(
+        &control_plane_scope(ctx)?,
+        ulid::Ulid::new().to_string(),
+        sequence,
+        MetastoreMutation::ManagedRootUpserted(record.clone()),
+    );
+    ledger
+        .append_event(&event)
+        .await
+        .map_err(map_catalog_error)?;
+    publish_storage_governance_projection(state, ctx).await
+}
+
+fn validate_managed_root_id(root_id: &str) -> Result<(), UnityCatalogError> {
+    validate_uuidv7(root_id)
+        .map(|_| ())
+        .map_err(|_| UnityCatalogError::BadRequest {
+            message: "managed root ID must be a canonical UUIDv7".to_string(),
+        })
 }
 
 async fn list_external_locations(

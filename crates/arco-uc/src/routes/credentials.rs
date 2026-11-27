@@ -168,6 +168,20 @@ pub(crate) async fn post_temporary_table_credentials(
         .ok_or_else(|| UnityCatalogError::NotFound {
             message: format!("table not found: {table_id}"),
         })?;
+    if table
+        .format
+        .as_deref()
+        .is_some_and(|format| format.eq_ignore_ascii_case("delta"))
+    {
+        let catalog = scoped_storage(&state, &ctx)?;
+        arco_catalog::managed_delta::resolve_analytical_storage(
+            state.managed_delta_storage.as_ref(),
+            &catalog,
+            &table,
+        )
+        .await
+        .map_err(map_catalog_error)?;
+    }
     let location = table
         .location
         .ok_or_else(|| UnityCatalogError::BadRequest {

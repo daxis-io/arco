@@ -54,6 +54,9 @@ use crate::idempotency::{
     check_idempotency,
 };
 use crate::lock::DistributedLock;
+use crate::managed_delta::{
+    self, ManagedDeltaAllocation, ManagedDeltaPlacement, ManagedDeltaStorage,
+};
 use crate::manifest::SnapshotInfo;
 use crate::parquet_util::{
     CatalogRecord, ColumnRecord, LineageEdgeRecord, NamespaceRecord, TableRecord,
@@ -5358,7 +5361,6 @@ impl CatalogWriter {
     /// - Schema doesn't exist within the catalog
     /// - Table name already exists in schema
     /// - Lock acquisition or storage operations fail
-    #[allow(clippy::too_many_lines)]
     pub async fn register_table_in_schema(
         &self,
         catalog: &str,
@@ -5366,7 +5368,70 @@ impl CatalogWriter {
         req: RegisterTableInSchemaRequest,
         opts: WriteOptions,
     ) -> Result<Table> {
-        let request_hash = Self::idempotency_request_hash(&serde_json::json!({
+        self.register_table_in_schema_impl(catalog, schema, req, opts, None)
+            .await
+    }
+
+    /// Allocates the owner verification fixture under a governed analytical root.
+    ///
+    /// # Errors
+    ///
+    /// Returns catalog write errors, denied governance, or conflicting allocation intent.
+    pub async fn allocate_managed_delta(
+        &self,
+        root: &ManagedDeltaStorage,
+        allocation: &ManagedDeltaAllocation,
+        opts: WriteOptions,
+    ) -> Result<ManagedDeltaPlacement> {
+        allocation.validate()?;
+        let request = RegisterTableInSchemaRequest {
+            name: managed_delta::TABLE.to_string(),
+            description: None,
+            location: None,
+            format: Some("delta".to_string()),
+            table_type: Some("MANAGED".to_string()),
+            properties: Some(BTreeMap::from([(
+                managed_delta::PLACEMENT_PROPERTY.to_string(),
+                managed_delta::PLACEMENT_VERSION.to_string(),
+            )])),
+            columns: managed_delta::TABLE_COLUMNS
+                .into_iter()
+                .zip(0..)
+                .map(|(name, ordinal)| ColumnDefinition {
+                    name: name.to_string(),
+                    data_type: "BIGINT".to_string(),
+                    is_nullable: false,
+                    ordinal,
+                    description: None,
+                })
+                .collect(),
+        };
+        let opts = WriteOptions {
+            idempotency_key: Some(IdempotencyKey::new(allocation.operation_id.to_string())),
+            ..opts
+        };
+        let table = self
+            .register_table_in_schema_impl(
+                managed_delta::CATALOG,
+                managed_delta::SCHEMA,
+                request,
+                opts,
+                Some((root, allocation)),
+            )
+            .await?;
+        ManagedDeltaPlacement::for_replay(&self.storage, root, &table, allocation).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn register_table_in_schema_impl(
+        &self,
+        catalog: &str,
+        schema: &str,
+        req: RegisterTableInSchemaRequest,
+        opts: WriteOptions,
+        placement: Option<(&ManagedDeltaStorage, &ManagedDeltaAllocation)>,
+    ) -> Result<Table> {
+        let request = serde_json::json!({
             "catalog": catalog,
             "schema": schema,
             "name": req.name.clone(),
@@ -5383,7 +5448,16 @@ impl CatalogWriter {
                 "description": column.description.clone(),
             })).collect::<Vec<_>>(),
             "if_match": opts.if_match.map(|version| version.as_u64()),
-        }))?;
+        });
+        let request_hash = if let Some((root, intent)) = placement {
+            Self::idempotency_request_hash(&serde_json::json!({
+                "registration": request,
+                "intent": intent,
+                "approved_root": root.root_uri(),
+            }))?
+        } else {
+            Self::idempotency_request_hash(&request)?
+        };
         let idempotency_store = self.idempotency_store();
         let mut idempotency = match check_idempotency(
             &idempotency_store,
@@ -5407,6 +5481,22 @@ impl CatalogWriter {
                     self.refresh_stale_reserved_idempotency(*marker, version)
                         .await?,
                 )
+            }
+            IdempotencyCheck::Replay {
+                entity_id,
+                entity_name,
+            } if placement.is_some() => {
+                return crate::reader::CatalogReader::new_with_scope(
+                    self.storage.clone(),
+                    self.scope.clone(),
+                )
+                .get_table_in_schema(catalog, schema, &entity_name)
+                .await?
+                .filter(|table| table.id == entity_id)
+                .ok_or_else(|| CatalogError::RequestFailed {
+                    http_status: 409,
+                    message: "managed_delta_allocation_incarnation_changed".to_string(),
+                });
             }
             IdempotencyCheck::Replay { entity_name, .. } => {
                 return self
@@ -5533,12 +5623,23 @@ impl CatalogWriter {
             let table_format = normalize_new_table_format(req.format.as_deref())?;
             let table_format_kind =
                 TableFormat::parse(&table_format).map_err(CatalogError::from)?;
-            let table_location = normalize_table_location_for_write(
-                table_format_kind,
-                req.location.clone(),
-                self.storage.tenant_id(),
-                self.storage.workspace_id(),
-            )?;
+            let table_location = if let Some((root, intent)) = placement {
+                let uuid = Uuid::parse_str(&table_id).map_err(CatalogError::storage)?;
+                match ManagedDeltaPlacement::create(&self.storage, root, uuid, intent).await {
+                    Ok(placement) => Some(placement.location),
+                    Err(error) => {
+                        guard.release().await?;
+                        return Err(error);
+                    }
+                }
+            } else {
+                normalize_table_location_for_write(
+                    table_format_kind,
+                    req.location.clone(),
+                    self.storage.tenant_id(),
+                    self.storage.workspace_id(),
+                )?
+            };
 
             let table = Table {
                 id: table_id.clone(),
@@ -5602,8 +5703,10 @@ impl CatalogWriter {
                 Ok(table)
             }
             (Some((marker, version)), Err(err)) => {
-                self.finalize_idempotency_failure(marker, version, &err)
-                    .await?;
+                if placement.is_none() || err.http_status_code().is_none_or(|status| status < 500) {
+                    self.finalize_idempotency_failure(marker, version, &err)
+                        .await?;
+                }
                 Err(err)
             }
             (None, result) => result,

@@ -52,6 +52,10 @@ mod governed_catalog_read;
 #[path = "support/usage.rs"]
 mod usage;
 
+#[cfg(feature = "aws")]
+#[path = "support/managed_delta_placement.rs"]
+mod managed_delta_placement;
+
 const TENANT: &str = "tenant1";
 const WORKSPACE: &str = "workspace1";
 const READER: &str = "user_reader";
@@ -602,6 +606,24 @@ async fn production_owner_path_rejects_unsupported_format() {
 }
 
 #[tokio::test]
+async fn production_managed_delta_allocation_requires_approved_root() {
+    let router = production_rs256_router(Arc::new(MemoryBackend::new()), STORAGE_ROOT);
+    let bearer = table_read_rs256_jwt(TENANT, WORKSPACE, READER);
+    let (status, _) = post_json(
+        &router,
+        "/api/v1/managed-delta/ensure",
+        &bearer,
+        json!({
+            "operation_id": Uuid::now_v7(),
+            "owner": READER,
+            "provisioning_fingerprint": "allocation-test-v1"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
 async fn production_native_delta_stage_requires_modify() {
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let (fixture, router, _) = managed_delta_fixture(backend, STORAGE_ROOT, WORKSPACE).await;
@@ -1085,6 +1107,7 @@ fn run_native_delta_reader(dir: &Path, version: i64, descriptor: &Value, bundle:
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/read_native_delta_snapshot.py");
     let result = std::process::Command::new(python)
         .env_clear()
+        .arg("-B")
         .arg(script)
         .arg(descriptor)
         .arg(bundle)
@@ -1962,11 +1985,32 @@ async fn delta_orders_commit(
     amounts: &[i64],
     protocol: Option<Value>,
 ) -> String {
-    let parquet = orders_parquet(amounts);
+    delta_fixture_commit(
+        &fixture.storage,
+        paths,
+        version,
+        orders_parquet(amounts),
+        &[
+            ("day", "date"),
+            ("amount_cents", "long"),
+            ("status", "string"),
+        ],
+        protocol,
+    )
+    .await
+}
+
+async fn delta_fixture_commit(
+    storage: &ScopedStorage,
+    paths: &DeltaPaths,
+    version: i64,
+    parquet: Bytes,
+    fields: &[(&str, &str)],
+    protocol: Option<Value>,
+) -> String {
     let file = format!("orders-{version}.parquet");
     assert!(matches!(
-        fixture
-            .storage
+        storage
             .put_raw(
                 &format!("{}/{}", paths.table_root(), file),
                 parquet.clone(),
@@ -1982,10 +2026,9 @@ async fn delta_orders_commit(
         actions.push(json!({"protocol": protocol.unwrap_or_else(|| json!({
             "minReaderVersion": 1, "minWriterVersion": 2
         }))}));
-        let fields = [("day", "date"), ("amount_cents", "long"), ("status", "string")]
-            .map(|(name, data_type)| {
+        let fields = fields.iter().map(|(name, data_type)| {
                 json!({"name": name, "type": data_type, "nullable": false, "metadata": {}})
-            });
+            }).collect::<Vec<_>>();
         actions.push(json!({"metaData": {
             "id": "d97c39b0-72c5-49b8-9f49-28fe5c9e5cee",
             "format": {"provider": "parquet", "options": {}},
@@ -2010,15 +2053,18 @@ fn orders_parquet(amounts: &[i64]) -> Bytes {
         Field::new("amount_cents", DataType::Int64, false),
         Field::new("status", DataType::Utf8, false),
     ]));
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
+    fixture_parquet(
+        schema,
         vec![
             Arc::new(Date32Array::from(vec![20_454; amounts.len()])),
             Arc::new(Int64Array::from(amounts.to_vec())),
             Arc::new(StringArray::from(vec!["paid"; amounts.len()])),
         ],
     )
-    .unwrap();
+}
+
+fn fixture_parquet(schema: Arc<Schema>, arrays: Vec<ArrayRef>) -> Bytes {
+    let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).unwrap();
     let mut writer = ArrowWriter::try_new(Vec::new(), schema, None).unwrap();
     writer.write(&batch).unwrap();
     Bytes::from(writer.into_inner().unwrap())
@@ -2065,7 +2111,9 @@ async fn post_json(router: &Router, path: &str, token: &str, body: Value) -> (St
         .unwrap();
     let response = router.clone().oneshot(request).await.unwrap();
     let status = response.status();
-    if (path.contains("/extensions/") || path.starts_with("/api/v1/event-streams/"))
+    if (path.contains("/extensions/")
+        || path.starts_with("/api/v1/event-streams/")
+        || path == "/api/v1/managed-delta/ensure")
         && status.is_success()
     {
         assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");

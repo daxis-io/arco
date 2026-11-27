@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use arco_catalog::authz::privileges::Privilege;
 use arco_catalog::credential_vending::{CredentialOperation, DEFAULT_CREDENTIAL_TTL};
+use arco_catalog::managed_delta::{PLACEMENT_PROPERTY, TABLE_COLUMNS, resolve_analytical_storage};
 use arco_catalog::storage_governance::{PathDecision, path_normalization::GovernedPath};
 use arco_catalog::{Column, Table};
 use arco_core::canonical_json::to_canonical_bytes;
@@ -26,7 +27,7 @@ use super::{
 };
 use crate::audit;
 use crate::context::UnityCatalogRequestContext;
-use crate::routes::common::scoped_storage;
+use crate::routes::common::{map_catalog_error, scoped_storage};
 use crate::routes::credentials::{
     AuthorizedCredentialPath, authorize_path_access, authorize_table_access,
     revalidate_observed_watermark,
@@ -89,7 +90,12 @@ async fn disclose_snapshot(
 ) -> UnityCatalogResult<Response> {
     let table_auth = authorize_table_access(state, ctx, table_id, Privilege::Select).await?;
     let (table, columns) = load_table(state, ctx, table_id).await?;
-    let root = DeltaRoot::resolve(state, ctx, &table)?;
+    let storage = scoped_storage(state, ctx)?;
+    let analytical =
+        resolve_analytical_storage(state.managed_delta_storage.as_ref(), &storage, &table)
+            .await
+            .map_err(map_catalog_error)?;
+    let root = DeltaRoot::resolve(state, ctx, &table, analytical.is_some())?;
     let fingerprint = table_fingerprint(&table, &columns)?;
     let authorization = authorize_path_access(
         state,
@@ -102,28 +108,30 @@ async fn disclose_snapshot(
     )
     .await?;
     let governance = DeltaGovernance::new(&authorization, ctx, &root.uri)?;
-    let storage = scoped_storage(state, ctx)?;
-    let snapshot = load_snapshot(&storage, &root.paths, &governance, version).await?;
-    let manifest = snapshot
-        .objects
-        .iter()
-        .map(|object| &object.identity)
-        .collect::<Vec<_>>();
-    let Value::Object(mut identity) = json!({
-        "format": "delta", "bundle_version": 1, "tenant": ctx.tenant, "workspace": ctx.workspace,
-        "table_id": table.id, "table_fingerprint": fingerprint, "delta_table_id": snapshot.delta_table_id,
-        "delta_version": version, "byte_size": snapshot.byte_size,
-        "manifest_sha256": canonical_digest(&manifest)?,
-    }) else {
-        return Err(identity_unavailable());
-    };
-    let snapshot_id = canonical_digest(&identity)?;
-    identity.insert("snapshot_id".to_string(), json!(snapshot_id));
-    let identity = Value::Object(identity);
+    let snapshot = load_snapshot(
+        &storage,
+        analytical.as_ref().unwrap_or(&storage),
+        &root.paths,
+        &governance,
+        version,
+    )
+    .await?;
+    if analytical.is_some() && !snapshot.matches_allocated_schema() {
+        return Err(bad_request("delta_read_allocated_schema_mismatch"));
+    }
+    let (snapshot_id, identity) = snapshot.identity(ctx, &table.id, &fingerprint, version)?;
 
     let final_table_auth = authorize_table_access(state, ctx, table_id, Privilege::Select).await?;
     let (final_table, final_columns) = load_table(state, ctx, table_id).await?;
     if table_fingerprint(&final_table, &final_columns)? != fingerprint {
+        return Err(table_read_conflict());
+    }
+    if resolve_analytical_storage(state.managed_delta_storage.as_ref(), &storage, &final_table)
+        .await
+        .map_err(map_catalog_error)?
+        .is_some()
+        != analytical.is_some()
+    {
         return Err(table_read_conflict());
     }
     let final_authorization = authorize_path_access(
@@ -187,6 +195,7 @@ impl DeltaRoot {
         state: &UnityCatalogState,
         ctx: &UnityCatalogRequestContext,
         table: &Table,
+        allocated: bool,
     ) -> UnityCatalogResult<Self> {
         if TableFormat::effective(table.format.as_deref()).ok() != Some(TableFormat::Delta)
             || !table
@@ -198,16 +207,23 @@ impl DeltaRoot {
         }
         if table.properties.as_ref().is_some_and(|properties| {
             properties.keys().any(|name| {
-                !matches!(
+                !(matches!(
                     name.as_str(),
                     "arco.dataset.grain"
                         | "arco.dataset.units"
                         | "arco.dataset.loaded_at"
                         | "arco.dataset.source_data_cutoff"
-                )
+                ) || allocated && name == PLACEMENT_PROPERTY)
             })
         }) {
             return Err(bad_request("delta_read_unsupported_table_properties"));
+        }
+        let id = Uuid::parse_str(&table.id)
+            .map_err(|_| bad_request("delta_read_invalid_table_id_or_version"))?;
+        let paths = DeltaPaths::legacy(id);
+        if allocated {
+            let uri = table.location.clone().ok_or_else(path_denied)?;
+            return Ok(Self { paths, uri });
         }
         let bucket = state
             .config
@@ -217,9 +233,6 @@ impl DeltaRoot {
             .ok_or_else(|| UnityCatalogError::ServiceUnavailable {
                 message: "delta_read_storage_mapping_unavailable".to_string(),
             })?;
-        let id = Uuid::parse_str(&table.id)
-            .map_err(|_| bad_request("delta_read_invalid_table_id_or_version"))?;
-        let paths = DeltaPaths::legacy(id);
         let uri = format!(
             "{bucket}/tenant={}/workspace={}/{}/",
             ctx.tenant,
@@ -300,13 +313,50 @@ struct Snapshot {
     byte_size: u64,
 }
 
+impl Snapshot {
+    fn matches_allocated_schema(&self) -> bool {
+        self.fields.len() == TABLE_COLUMNS.len()
+            && self
+                .fields
+                .iter()
+                .zip(TABLE_COLUMNS)
+                .all(|(field, name)| field.name == name && field.kind == "long" && !field.nullable)
+    }
+
+    fn identity(
+        &self,
+        ctx: &UnityCatalogRequestContext,
+        table_id: &str,
+        fingerprint: &str,
+        version: i64,
+    ) -> UnityCatalogResult<(String, Value)> {
+        let manifest = self
+            .objects
+            .iter()
+            .map(|object| &object.identity)
+            .collect::<Vec<_>>();
+        let Value::Object(mut identity) = json!({
+            "format": "delta", "bundle_version": 1, "tenant": ctx.tenant, "workspace": ctx.workspace,
+            "table_id": table_id, "table_fingerprint": fingerprint, "delta_table_id": self.delta_table_id,
+            "delta_version": version, "byte_size": self.byte_size,
+            "manifest_sha256": canonical_digest(&manifest)?,
+        }) else {
+            return Err(identity_unavailable());
+        };
+        let snapshot_id = canonical_digest(&identity)?;
+        identity.insert("snapshot_id".to_string(), json!(snapshot_id));
+        Ok((snapshot_id, Value::Object(identity)))
+    }
+}
+
 async fn load_snapshot(
+    catalog: &ScopedStorage,
     storage: &ScopedStorage,
     paths: &DeltaPaths,
     governance: &DeltaGovernance<'_>,
     version: i64,
 ) -> UnityCatalogResult<Snapshot> {
-    let digests = DeltaCommitCoordinator::with_paths(storage.clone(), paths.clone())
+    let digests = DeltaCommitCoordinator::with_paths(catalog.clone(), paths.clone())
         .pinned_log_digests(version)
         .await
         .map_err(coordinator_error)?;

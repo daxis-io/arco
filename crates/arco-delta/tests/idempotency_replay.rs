@@ -13,7 +13,7 @@ use std::time::Duration;
 use arco_core::storage::{
     MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
 };
-use arco_core::{Error as CoreError, Result as CoreResult, ScopedStorage};
+use arco_core::{DeltaPaths, Error as CoreError, Result as CoreResult, ScopedStorage};
 use arco_delta::{
     CommitDeltaRequest, DeltaCommitCoordinator, DeltaCoordinatorState, DeltaError, InflightCommit,
 };
@@ -59,7 +59,13 @@ async fn owner_replacement_receipt_is_readable_after_coordinator_recovery() {
     let backend = Arc::new(FailOnceBackend::new());
     let storage = ScopedStorage::new(backend.clone(), TENANT, WORKSPACE).expect("scope");
     let table_id = Uuid::now_v7();
-    let coordinator = DeltaCommitCoordinator::new(storage, table_id);
+    let paths = DeltaPaths::legacy(table_id);
+    let log_storage = ScopedStorage::new(Arc::new(MemoryBackend::new()), TENANT, WORKSPACE)
+        .expect("analytical scope")
+        .with_storage_prefix("approved")
+        .expect("approved prefix");
+    let coordinator = DeltaCommitCoordinator::with_paths(storage.clone(), paths.clone())
+        .with_log_storage(log_storage.clone());
     let key = Uuid::now_v7().to_string();
     let log = Bytes::from_static(b"{\"commitInfo\":{}}\n");
     // Root binding and reservation precede finalization.
@@ -98,6 +104,21 @@ async fn owner_replacement_receipt_is_readable_after_coordinator_recovery() {
             .await
             .expect("read finalized"),
         receipt
+    );
+    let path = paths.delta_log_json(0).expect("log path");
+    assert!(
+        storage
+            .head_raw(&path)
+            .await
+            .expect("catalog head")
+            .is_none()
+    );
+    assert!(
+        log_storage
+            .head_raw(&path)
+            .await
+            .expect("analytical head")
+            .is_some()
     );
 }
 

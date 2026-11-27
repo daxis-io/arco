@@ -602,6 +602,9 @@ pub struct StorageConfig {
     /// In GCS deployments this is injected via Terraform as `ARCO_STORAGE_BUCKET`.
     #[serde(default)]
     pub bucket: Option<String>,
+    /// Approved S3 bucket and prefix for Arco-owned managed Delta allocations.
+    #[serde(default)]
+    pub managed_delta_root: Option<String>,
 }
 
 impl Config {
@@ -632,6 +635,7 @@ impl Config {
     /// - `ARCO_TASK_TOKEN_AUDIENCE`
     /// - `ARCO_TASK_TOKEN_TTL_SECS`
     /// - `ARCO_STORAGE_BUCKET`
+    /// - `ARCO_MANAGED_DELTA_ROOT`
     /// - `ARCO_COMPACTOR_URL`
     /// - `ARCO_COMPACTOR_AUTH_MODE` (`none` | `static_bearer` | `gcp_id_token`)
     /// - `ARCO_COMPACTOR_AUTH_STATIC_BEARER_TOKEN`
@@ -757,6 +761,7 @@ impl Config {
         if let Some(bucket) = env_string("ARCO_STORAGE_BUCKET") {
             config.storage.bucket = Some(bucket);
         }
+        config.storage.managed_delta_root = env_string("ARCO_MANAGED_DELTA_ROOT");
         if let Some(url) = env_string("ARCO_COMPACTOR_URL") {
             config.compactor_url = Some(url);
         }

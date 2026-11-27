@@ -116,6 +116,8 @@ async fn governed_catalog_exposes_only_the_read_profile_and_requires_a_pin() {
     }
     for path in [
         "/api/v1/browser/urls",
+        "/api/v1/managed-delta/ensure",
+        "/api/v1/managed-delta/storage",
         "/internal/control-store/catalog-projection/urls",
         "/api/v1/event-streams/fixture-events/events",
         "/api/2.1/unity-catalog/temporary-table-credentials",

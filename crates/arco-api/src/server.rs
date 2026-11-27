@@ -137,6 +137,7 @@ pub struct AppState {
     storage: Arc<dyn arco_core::storage::StorageBackend>,
     /// Authoritative catalog permissions shared by the native and UC routers.
     pub(crate) catalog_permissions: Arc<dyn CompiledPermissionSource>,
+    pub(crate) managed_delta_storage: Option<arco_catalog::managed_delta::ManagedDeltaStorage>,
     /// Rate limiting state (shared across tenants).
     rate_limit: Arc<RateLimitState>,
     /// Sync compaction client (Tier-1 DDL).
@@ -155,6 +156,10 @@ impl std::fmt::Debug for AppState {
             .field("config", &self.config)
             .field("storage", &"<StorageBackend>")
             .field("catalog_permissions", &"<CompiledPermissionSource>")
+            .field(
+                "managed_delta_storage",
+                &self.managed_delta_storage.is_some(),
+            )
             .field("rate_limit", &"<RateLimitState>")
             .field("sync_compactor", &self.sync_compactor.is_some())
             .field("sensor_evaluator", &"<SensorEvaluator>")
@@ -211,6 +216,7 @@ impl AppState {
         Self {
             config,
             catalog_permissions: Arc::new(MetastorePermissionSource::new(Arc::clone(&storage))),
+            managed_delta_storage: None,
             storage,
             rate_limit,
             sync_compactor,
@@ -817,24 +823,28 @@ impl Server {
         &self.config
     }
 
-    #[allow(
-        clippy::expect_used,
-        reason = "serve validates the exact-root binding configuration before constructing state; test_router treats invalid fixture configuration as a test bug"
-    )]
-    fn create_state(&self) -> Arc<AppState> {
-        let bindings = self
-            .config
-            .catalog_authority_bindings()
-            .expect("server configuration must validate before state construction");
-        Arc::new(
-            AppState::new_with_audit(
-                self.config.clone(),
-                Arc::clone(&self.storage),
-                Arc::clone(&self.sensor_evaluator),
-                self.audit_emitter.clone(),
-            )
-            .with_catalog_authority_bindings(Arc::new(bindings)),
+    fn create_state(&self) -> Result<Arc<AppState>> {
+        let bindings = self.config.catalog_authority_bindings()?;
+        let mut state = AppState::new_with_audit(
+            self.config.clone(),
+            Arc::clone(&self.storage),
+            Arc::clone(&self.sensor_evaluator),
+            self.audit_emitter.clone(),
         )
+        .with_catalog_authority_bindings(Arc::new(bindings));
+        state.managed_delta_storage = self
+            .config
+            .storage
+            .managed_delta_root
+            .as_deref()
+            .map(|root| {
+                arco_catalog::managed_delta::ManagedDeltaStorage::open(
+                    root,
+                    arco_storage::from_bucket,
+                )
+            })
+            .transpose()?;
+        Ok(Arc::new(state))
     }
 
     /// Creates the router with all routes and middleware.
@@ -878,6 +888,7 @@ impl Server {
     ) -> UnityCatalogState {
         UnityCatalogState::with_config(Arc::clone(&state.storage), config)
             .with_catalog_authority_bindings(state.catalog_authority_bindings())
+            .with_managed_delta_storage(state.managed_delta_storage.clone())
             .with_permission_source(Arc::clone(&state.catalog_permissions))
     }
 
@@ -1215,7 +1226,7 @@ impl Server {
             None
         };
 
-        let state = self.create_state();
+        let state = self.create_state()?;
         let http_addr = SocketAddr::from(([0, 0, 0, 0], self.config.http_port));
         let router = self.create_router(Arc::clone(&state), credential_provider);
 
@@ -1278,8 +1289,14 @@ impl Server {
     /// using this server's configured storage backend (default: in-memory).
     /// Credential vending is disabled in test mode.
     #[doc(hidden)]
+    #[allow(
+        clippy::expect_used,
+        reason = "invalid fixture configuration is a test bug"
+    )]
     pub fn test_router(&self) -> Router {
-        let state = self.create_state();
+        let state = self
+            .create_state()
+            .expect("valid server fixture configuration");
         self.create_router(state, None)
     }
 

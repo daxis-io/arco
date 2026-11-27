@@ -20,8 +20,8 @@ use arco_catalog::storage_governance::StorageGovernanceState;
 use crate::context::UnityCatalogRequestContext;
 use crate::error::UnityCatalogError;
 use crate::routes::common::{
-    control_plane_scope, map_catalog_error, publish_storage_governance_projection, require_authz,
-    scoped_storage,
+    control_plane_scope, governance_mutation_view, map_catalog_error,
+    publish_storage_governance_projection, require_authz, scoped_storage,
 };
 use crate::state::UnityCatalogState;
 
@@ -58,7 +58,7 @@ async fn create_storage_credential(
     // earlier commit whose synchronous publication failed (#362).
     publish_storage_governance_projection(&state, &ctx).await?;
     let ledger = ledger(&state, &ctx)?;
-    let metastore = ledger.replay().await.map_err(map_catalog_error)?;
+    let (metastore, sequence) = governance_mutation_view(&ledger).await?;
     let storage_state =
         StorageGovernanceState::from_metastore_state(&metastore).map_err(map_catalog_error)?;
     if storage_state
@@ -78,7 +78,7 @@ async fn create_storage_credential(
     let event = MetastoreEvent::new_scoped(
         &scope,
         ulid::Ulid::new().to_string(),
-        ledger.next_sequence().await.map_err(map_catalog_error)?,
+        sequence,
         MetastoreMutation::StorageCredentialUpserted(StorageCredentialRecord {
             credential_id: request.credential_id,
             name: request.name,

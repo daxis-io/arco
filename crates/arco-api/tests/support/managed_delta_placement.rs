@@ -1,7 +1,7 @@
 //! Two-store qualification through the production JWT and catalog routers.
 
 use super::{
-    READER, TENANT, WORKSPACE, assert_delta_snapshot, commit_delta, delta_fixture_commit,
+    INTRUDER, READER, TENANT, WORKSPACE, assert_delta_snapshot, commit_delta, delta_fixture_commit,
     extension_path, fixture_parquet, next_fixture_sequence, post_json, production_rs256_config,
     table_read_catalog, table_read_rs256_jwt, write_proof_json,
 };
@@ -26,7 +26,7 @@ use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use axum::Router;
 use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode, header};
+use axum::http::{Method, Request, StatusCode, header};
 use bytes::Bytes;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -40,12 +40,110 @@ const ROOT_ID: &str = "approved_managed_delta";
 const ENSURE: &str = "/api/v1/managed-delta/ensure";
 const STORAGE: &str = "/api/v1/managed-delta/storage";
 const PREVIEW: &str = "/api/2.1/unity-catalog/delta/preview/commits";
+const MANAGED_ROOTS: &str = "/api/2.1/unity-catalog/storage-governance/managed-roots";
+
+#[tokio::test]
+async fn production_managed_root_admin_uses_config_and_never_reactivates_revoked_id() {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let root = "s3://analytic-bucket/approved/managed";
+    let catalog = ScopedStorage::new(Arc::clone(&backend), TENANT, WORKSPACE).unwrap();
+    seed_root_admin(&catalog).await;
+    let active = router(&backend, "s3://catalog-bucket", Some(root));
+    let root_id = Uuid::now_v7();
+    let uri = format!("{MANAGED_ROOTS}/{root_id}");
+    let authorized = table_read_rs256_jwt(TENANT, WORKSPACE, READER);
+    let unauthorized = table_read_rs256_jwt(TENANT, WORKSPACE, INTRUDER);
+    assert_eq!(
+        root_request(&active, Method::PUT, &uri, &unauthorized)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let (status, created) = root_request(&active, Method::PUT, &uri, &authorized).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(
+        created.get("url").and_then(Value::as_str),
+        Some("s3://analytic-bucket/approved/managed/tenant=tenant1/workspace=workspace1/")
+    );
+    assert_eq!(
+        root_request(&active, Method::PUT, &uri, &authorized).await,
+        (StatusCode::OK, created)
+    );
+    let sibling = format!("{MANAGED_ROOTS}/{}", Uuid::now_v7());
+    assert_eq!(
+        root_request(&active, Method::PUT, &sibling, &authorized)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+
+    let unconfigured = router(&backend, "s3://catalog-bucket", None);
+    let (status, revoked) = root_request(&unconfigured, Method::DELETE, &uri, &authorized).await;
+    assert_eq!(status, StatusCode::OK, "{revoked}");
+    assert_eq!(
+        root_request(&unconfigured, Method::DELETE, &uri, &authorized).await,
+        (StatusCode::OK, revoked)
+    );
+    assert_eq!(
+        root_request(&active, Method::PUT, &uri, &authorized)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        root_request(&active, Method::PUT, &sibling, &authorized)
+            .await
+            .0,
+        StatusCode::CREATED
+    );
+}
+
+async fn seed_root_admin(catalog: &ScopedStorage) {
+    publish(
+        catalog,
+        [
+            reader_principal(),
+            object(catalog.workspace_id(), "METASTORE", catalog.workspace_id()),
+            grant(
+                catalog.workspace_id(),
+                "METASTORE",
+                "MANAGE",
+                LifecycleState::Active,
+            ),
+        ],
+    )
+    .await;
+}
+
+async fn root_request(
+    router: &Router,
+    method: Method,
+    uri: &str,
+    token: &str,
+) -> (StatusCode, Value) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+    let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, body)
+}
 
 #[tokio::test]
 async fn managed_delta_allocation_replay_does_not_adopt_recreated_table() {
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let uri = "s3://analytic-bucket/approved/managed";
-    let catalog = seed_scope(&backend, TENANT, WORKSPACE, uri).await;
+    let catalog = seed_scope(&backend, TENANT, WORKSPACE, Some(uri)).await;
     let root = ManagedDeltaStorage::open(uri, |bucket| {
         assert_eq!(bucket, "s3://analytic-bucket");
         Ok(Arc::new(MemoryBackend::new()))
@@ -145,8 +243,12 @@ async fn production_managed_delta_allocation_minio() {
     let catalog_backend = arco_storage::from_bucket(&bucket).unwrap();
     let data_backend = arco_storage::from_bucket(&analytics).unwrap();
     let router = router(&catalog_backend, &bucket, Some(&root));
-    let catalog = seed_scope(&catalog_backend, TENANT, WORKSPACE, &root).await;
+    let catalog = seed_scope(&catalog_backend, TENANT, WORKSPACE, None).await;
+    seed_root_admin(&catalog).await;
     let token = table_read_rs256_jwt(TENANT, WORKSPACE, READER);
+    let root_path = format!("{MANAGED_ROOTS}/{}", Uuid::now_v7());
+    let (status, approved) = root_request(&router, Method::PUT, &root_path, &token).await;
+    assert_eq!(status, StatusCode::CREATED, "{approved}");
     let data = analytical_scope(&data_backend, TENANT, WORKSPACE);
     verify_storage_probe(&router, &catalog, &data, &token, evidence).await;
     let request = json!({
@@ -197,23 +299,15 @@ async fn production_managed_delta_allocation_minio() {
     .await;
     publish(
         &catalog,
-        [managed_root(&catalog, &root, LifecycleState::Deleted)],
+        [grant(table_id, "TABLE", "SELECT", LifecycleState::Active)],
     )
     .await;
-    let (status, error) = post_json(&router, ENSURE, &token, request.clone()).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{error}");
-    let (status, error) = post_json(
-        &router,
-        STORAGE,
-        &token,
-        json!({"operation_id": Uuid::now_v7()}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{error}");
-    let stage = format!("/api/v1/delta/tables/{table_id}/commits/stage");
-    let (status, error) = post_json(&router, &stage, &token, json!({"payload": "{}"})).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{error}");
-    write_proof_json(evidence, "revoked-root.json", &error);
+    let revocation = revoke_and_probe(&router, &root_path, table_id, &token, &pin, &request).await;
+    write_proof_json(
+        evidence,
+        "root-admin.json",
+        &json!({"path": root_path, "approved": approved, "revocation": revocation}),
+    );
     verify_isolation(
         &router,
         &catalog_backend,
@@ -267,6 +361,48 @@ async fn verify_storage_probe(
     );
 }
 
+async fn revoke_and_probe(
+    router: &Router,
+    root_path: &str,
+    table_id: &str,
+    token: &str,
+    pin: &Value,
+    allocation: &Value,
+) -> Value {
+    let base = format!("/api/v1/delta/tables/{table_id}/commits");
+    let stage = format!("{base}/stage");
+    let (status, staged) = post_json(router, &stage, token, json!({"payload": "{}"})).await;
+    assert_eq!(status, StatusCode::OK, "{staged}");
+    let read_path = extension_path("table-reads", table_id);
+    let read = json!({"delta_version": 0, "expected_snapshot_id": pin.get("snapshot_id").unwrap()});
+    let (status, value) = post_json(router, &read_path, token, read.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+
+    let (status, revoked) = root_request(router, Method::DELETE, root_path, token).await;
+    assert_eq!(status, StatusCode::OK, "{revoked}");
+    let commit = json!({
+        "read_version": 1,
+        "staged_path": staged.get("staged_path").unwrap(),
+        "staged_version": staged.get("staged_version").unwrap()
+    });
+    let mut denials = BTreeMap::new();
+    for (path, body) in [
+        (read_path.as_str(), read),
+        (stage.as_str(), json!({"payload": "{}"})),
+        (base.as_str(), commit),
+        (ENSURE, allocation.clone()),
+        (STORAGE, json!({"operation_id": Uuid::now_v7()})),
+    ] {
+        let (status, response) = post_json(router, path, token, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
+        denials.insert(
+            path,
+            json!({"status": status.as_u16(), "response": response}),
+        );
+    }
+    json!({"revoked": revoked, "denials": denials})
+}
+
 fn router(backend: &Arc<dyn StorageBackend>, bucket: &str, root: Option<&str>) -> Router {
     let mut config = production_rs256_config(bucket);
     config.storage.managed_delta_root = root.map(str::to_string);
@@ -281,7 +417,7 @@ async fn seed_scope(
     backend: &Arc<dyn StorageBackend>,
     tenant: &str,
     workspace: &str,
-    root: &str,
+    root: Option<&str>,
 ) -> ScopedStorage {
     let catalog = ScopedStorage::new(Arc::clone(backend), tenant, workspace).unwrap();
     let writer = table_read_catalog(&catalog).await;
@@ -297,19 +433,12 @@ async fn seed_scope(
     publish(
         &catalog,
         [
-            MetastoreMutation::PrincipalUpserted(PrincipalRecord {
-                principal_id: READER.to_string(),
-                name: READER.to_string(),
-                principal_kind: PrincipalKind::User,
-                owner: READER.to_string(),
-                lifecycle_state: LifecycleState::Active,
-                updated_at_ms: 1,
-                properties: BTreeMap::new(),
-            }),
+            reader_principal(),
             object(&schema, "SCHEMA", &schema),
             grant(&schema, "SCHEMA", "CREATE_TABLE", LifecycleState::Active),
-            managed_root(&catalog, root, LifecycleState::Active),
-        ],
+        ]
+        .into_iter()
+        .chain(root.map(|uri| managed_root(&catalog, uri, LifecycleState::Active))),
     )
     .await;
     catalog
@@ -332,6 +461,18 @@ fn object(id: &str, kind: &str, name: &str) -> MetastoreMutation {
         object_type: kind.to_string(),
         qualified_name: name.to_string(),
         owner: "catalog_administrator".to_string(),
+        lifecycle_state: LifecycleState::Active,
+        updated_at_ms: 1,
+        properties: BTreeMap::new(),
+    })
+}
+
+fn reader_principal() -> MetastoreMutation {
+    MetastoreMutation::PrincipalUpserted(PrincipalRecord {
+        principal_id: READER.to_string(),
+        name: READER.to_string(),
+        principal_kind: PrincipalKind::User,
+        owner: READER.to_string(),
         lifecycle_state: LifecycleState::Active,
         updated_at_ms: 1,
         properties: BTreeMap::new(),
@@ -665,8 +806,8 @@ async fn verify_isolation(
     evidence: &Path,
 ) {
     let other_tenant = "tenant2";
-    let catalog = seed_scope(catalog_backend, other_tenant, WORKSPACE, root).await;
-    seed_scope(catalog_backend, TENANT, "workspace2", root).await;
+    let catalog = seed_scope(catalog_backend, other_tenant, WORKSPACE, Some(root)).await;
+    seed_scope(catalog_backend, TENANT, "workspace2", Some(root)).await;
     let token = table_read_rs256_jwt(other_tenant, WORKSPACE, READER);
     let receipt = allocate(router, &catalog, &token, root, request, evidence).await;
     let id = receipt.get("id").and_then(Value::as_str).unwrap();

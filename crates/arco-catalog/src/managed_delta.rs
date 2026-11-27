@@ -113,14 +113,17 @@ impl ManagedDeltaStorage {
         self.root.canonical_uri()
     }
 
-    fn scoped_uri(&self, catalog: &ScopedStorage, path: &str) -> String {
-        format!("{}{}/{path}", self.root_uri(), catalog.scope().prefix())
+    /// Returns the approved analytical prefix for the supplied catalog scope.
+    #[must_use]
+    pub fn workspace_uri(&self, storage: &ScopedStorage) -> String {
+        format!("{}{}/", self.root_uri(), storage.scope().prefix())
     }
 
-    fn table_uri(&self, catalog: &ScopedStorage, table_id: Uuid) -> String {
-        self.scoped_uri(
-            catalog,
-            &format!("{}/", DeltaPaths::legacy(table_id).table_root()),
+    fn table_uri(&self, storage: &ScopedStorage, table_id: Uuid) -> String {
+        format!(
+            "{}{}/",
+            self.workspace_uri(storage),
+            DeltaPaths::legacy(table_id).table_root()
         )
     }
 
@@ -143,7 +146,8 @@ impl ManagedDeltaStorage {
         operation_id: Uuid,
     ) -> Result<(ScopedStorage, String)> {
         let path = format!("managed-delta/probes/{operation_id}");
-        governed_root(catalog, &self.scoped_uri(catalog, &path)).await?;
+        let uri = format!("{}{path}", self.workspace_uri(catalog));
+        governed_root(catalog, &uri).await?;
         Ok((self.scoped_storage(catalog)?, path))
     }
 }

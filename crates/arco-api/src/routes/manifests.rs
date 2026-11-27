@@ -572,6 +572,16 @@ pub(crate) async fn deploy_manifest(
 
     ensure_workspace(&ctx, &workspace_id)?;
     validate_manifest(&request)?;
+    if state.worker_pull_pilot().is_some() {
+        if !request.schedules.is_empty() {
+            return Err(ApiError::conflict(
+                "manifest schedules are unsupported in the worker-pull pilot",
+            ));
+        }
+        for asset in &request.assets {
+            crate::worker_pull_pilot::ExecutionLimits::parse(&asset.execution, &asset.io)?;
+        }
+    }
 
     let fingerprint = compute_fingerprint(&request)?;
     let idempotency_key = ctx.idempotency_key.clone();

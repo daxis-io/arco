@@ -112,6 +112,8 @@ pub async fn append_events_and_compact_with_result(
     events: Vec<OrchestrationEvent>,
     request_id: Option<&str>,
 ) -> Result<OrchestrationCommitOutcome, OrchestrationCommitError> {
+    crate::worker_pull_pilot::require_legacy_flow_writes(config)
+        .map_err(OrchestrationCommitError::Definite)?;
     if events.is_empty() {
         return Err(OrchestrationCommitError::Definite(ApiError::bad_request(
             "orchestration batch must include at least one event",
@@ -192,6 +194,7 @@ pub async fn compact_event_paths_with_result(
     event_paths: Vec<String>,
     request_id: Option<&str>,
 ) -> Result<OrchestrationCommitOutcome, ApiError> {
+    crate::worker_pull_pilot::require_legacy_flow_writes(config)?;
     if event_paths.is_empty() {
         return Err(ApiError::bad_request(
             "orchestration repair must include at least one event path",

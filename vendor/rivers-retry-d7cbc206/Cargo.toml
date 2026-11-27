@@ -1,0 +1,15 @@
+[package]
+name = "rivers-retry"
+version = "0.0.0+d7cbc206"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "Pinned Rivers retry policy source for Arco Flow"
+repository = "https://github.com/ion-elgreco/rivers"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[workspace]

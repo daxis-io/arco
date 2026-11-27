@@ -87,6 +87,12 @@ pub(crate) fn request_context_from_headers(
         extract_from_jwt(headers, state, &request_id)?
     };
 
+    if state
+        .worker_pull_pilot()
+        .is_some_and(|pilot| !pilot.matches(&tenant, &workspace))
+    {
+        return Err(ApiError::not_found("workspace not found").with_request_id(request_id));
+    }
     let tenant = normalize_scope_id(&tenant, "tenant_id", &request_id)?;
     let workspace = normalize_scope_id(&workspace, "workspace_id", &request_id)?;
 

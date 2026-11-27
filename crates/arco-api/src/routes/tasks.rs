@@ -423,6 +423,10 @@ pub async fn task_auth_middleware(
         (claims.tenant_id, claims.workspace_id)
     };
 
+    if let Err(error) = crate::worker_pull_pilot::require_legacy_flow_writes(&state.config) {
+        return error.with_request_id(request_id).into_response();
+    }
+
     let ctx = RequestContext {
         tenant,
         workspace,

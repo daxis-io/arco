@@ -450,17 +450,7 @@ impl AntiEntropySweeper {
         dispatched_tasks: &HashSet<(String, String, u32)>,
         now: DateTime<Utc>,
     ) -> Option<Repair> {
-        if task.attempt >= task.max_attempts {
-            return None;
-        }
-        // A missing deadline means the task predates the fold-time retry
-        // scheduling introduced for issue #337 (nothing else ever set
-        // `retry_not_before`). Such a task is already wedged, so bootstrap it
-        // immediately; only a deadline still in the future defers the retry.
-        if task.retry_not_before.is_some_and(|deadline| now < deadline) {
-            return None;
-        }
-        let next_attempt = task.attempt + 1;
+        let next_attempt = Self::due_retry_attempt(task, now)?;
         let key = (task.run_id.clone(), task.task_key.clone(), next_attempt);
         if dispatched_tasks.contains(&key) {
             return None;
@@ -471,6 +461,20 @@ impl AntiEntropySweeper {
             attempt: next_attempt,
             reason: "retry_wait_bootstrap".to_string(),
         })
+    }
+
+    pub(crate) fn due_retry_attempt(task: &TaskRow, now: DateTime<Utc>) -> Option<u32> {
+        if task.attempt >= task.max_attempts {
+            return None;
+        }
+        // A missing deadline means the task predates the fold-time retry
+        // scheduling introduced for issue #337 (nothing else ever set
+        // `retry_not_before`). Such a task is already wedged, so bootstrap it
+        // immediately; only a deadline still in the future defers the retry.
+        if task.retry_not_before.is_some_and(|deadline| now < deadline) {
+            return None;
+        }
+        Some(task.attempt + 1)
     }
 
     fn check_running_task(task: &TaskRow, now: DateTime<Utc>) -> Option<Repair> {

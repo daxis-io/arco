@@ -190,6 +190,9 @@ async fn run_handler(
     State(state): State<DispatcherServiceState>,
 ) -> Result<Json<RunSummary>, ApiError> {
     let (manifest, fold_state) = state.compactor.load_state().await?;
+    if manifest.uses_worker_pull() {
+        return Err(Error::configuration("use the worker-pull host for this workspace").into());
+    }
 
     let ready_controller = ReadyDispatchController::with_defaults();
     let ready_actions = ready_controller.reconcile(&manifest, &fold_state);

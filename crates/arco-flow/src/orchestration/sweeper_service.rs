@@ -204,6 +204,9 @@ async fn run_handler(
     State(state): State<SweeperServiceState>,
 ) -> Result<Json<RunSummary>, ApiError> {
     let (manifest, fold_state) = state.compactor.load_state().await?;
+    if manifest.uses_worker_pull() {
+        return Err(Error::configuration("use the worker-pull host for this workspace").into());
+    }
     let sweeper = AntiEntropySweeper::with_defaults();
 
     let tasks: Vec<_> = fold_state.tasks.values().cloned().collect();

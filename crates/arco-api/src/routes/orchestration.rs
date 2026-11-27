@@ -45,6 +45,7 @@ use crate::paths::{
 };
 use crate::routes::manifests::StoredManifest;
 use crate::server::AppState;
+use crate::worker_pull_pilot::require_legacy_flow_writes;
 use arco_core::{
     Error as CoreError, ScopedStorage, StorageBackend, WritePrecondition, WriteResult,
 };
@@ -4306,19 +4307,62 @@ async fn recover_reserved_plan(
     reservation: &RunKeyReservation,
 ) -> Result<(), ApiError> {
     let plan = load_reserved_plan(storage, reservation).await?;
+    publish_accepted_plan(
+        state,
+        ctx,
+        storage,
+        &plan,
+        reservation
+            .accepted_plan_sha256
+            .as_deref()
+            .unwrap_or_default(),
+    )
+    .await
+}
+
+async fn publish_accepted_plan(
+    state: &AppState,
+    ctx: &RequestContext,
+    storage: &ScopedStorage,
+    plan: &arco_flow::orchestration::accepted_plan::AcceptedRunPlan,
+    sha256: &str,
+) -> Result<(), ApiError> {
+    if let Some(pilot) = state.worker_pull_pilot() {
+        if plan.version != 2 {
+            return Err(ApiError::conflict(
+                "worker-pull reservation lacks a bound retry policy",
+            ));
+        }
+        return Box::pin(pilot.host.accept_plan(plan))
+            .await
+            .map(|_| ())
+            .map_err(|error| pilot_acceptance_error(&error));
+    }
     append_events_and_compact(
         &state.config,
         storage.clone(),
-        plan.publication_events(
-            reservation
-                .accepted_plan_sha256
-                .as_deref()
-                .unwrap_or_default(),
-        ),
-        Some(ctx.request_id.as_str()),
+        plan.publication_events(sha256),
+        Some(&ctx.request_id),
     )
     .await
     .map(|_| ())
+}
+
+fn pilot_acceptance_error(error: &arco_flow::orchestration::worker_pull::PullError) -> ApiError {
+    use arco_flow::orchestration::worker_pull::PullError;
+    match error {
+        PullError::Invalid(message) => ApiError::bad_request(*message),
+        PullError::RunNotFound => ApiError::not_found("run not found"),
+        PullError::Conflict(message) => ApiError::conflict(*message),
+        PullError::Unauthorized => ApiError::unauthorized("worker-pull acceptance is unauthorized"),
+        PullError::Retryable(_) | PullError::Authority(_) => {
+            tracing::warn!(%error, "worker-pull acceptance needs a keyed retry");
+            ApiError::from_status_and_message(
+                StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                "worker-pull acceptance needs a retry with the same run key",
+            )
+        }
+    }
 }
 
 async fn reconcile_reserved_plan(
@@ -4327,6 +4371,11 @@ async fn reconcile_reserved_plan(
     storage: &ScopedStorage,
     reservation: &RunKeyReservation,
 ) -> Result<RunStateResponse, ApiError> {
+    let pilot = state.worker_pull_pilot().is_some();
+    if pilot {
+        // Validate the reservation's immutable bytes and exact event IDs even after publication.
+        recover_reserved_plan(state, ctx, storage, reservation).await?;
+    }
     if let Ok(folded) = load_orchestration_state(ctx, state).await {
         if let Some(run) = folded.runs.get(&reservation.run_id) {
             let tasks: Vec<_> = folded
@@ -4339,7 +4388,9 @@ async fn reconcile_reserved_plan(
             }
         }
     }
-    recover_reserved_plan(state, ctx, storage, reservation).await?;
+    if !pilot {
+        recover_reserved_plan(state, ctx, storage, reservation).await?;
+    }
     Ok(RunStateResponse::Pending)
 }
 
@@ -4396,6 +4447,29 @@ pub(crate) async fn trigger_run(
     validate_trigger_run_request_limits(&request)?;
 
     reject_reserved_lineage_labels(&request.labels)?;
+    let pilot = state.worker_pull_pilot().is_some();
+    if pilot {
+        if !request.run_key.as_deref().is_some_and(|key| {
+            !key.is_empty() && key.trim() == key && !key.chars().any(char::is_control)
+        }) {
+            return Err(ApiError::bad_request(
+                "worker-pull submission requires a valid runKey or Idempotency-Key",
+            ));
+        }
+        if request
+            .labels
+            .contains_key(arco_flow::orchestration::accepted_plan::RETRY_POLICY_LABEL)
+        {
+            return Err(ApiError::bad_request(
+                "retry policy is a reserved run label",
+            ));
+        }
+    }
+    let fingerprint_policy = if pilot {
+        FingerprintPolicy::with_cutoff(DateTime::<Utc>::MIN_UTC)
+    } else {
+        FingerprintPolicy::from_cutoff(state.config.run_key_fingerprint_cutoff)
+    };
 
     // Generate IDs upfront (needed for reservation)
     let run_id = Ulid::new().to_string();
@@ -4456,9 +4530,6 @@ pub(crate) async fn trigger_run(
     };
 
     if request.run_key.is_some() {
-        let fingerprint_policy =
-            FingerprintPolicy::from_cutoff(state.config.run_key_fingerprint_cutoff);
-
         let existing = existing_reservation;
 
         if let Some(existing) = existing {
@@ -4515,18 +4586,29 @@ pub(crate) async fn trigger_run(
     let context = plan_context
         .as_ref()
         .ok_or_else(|| ApiError::internal("missing plan context"))?;
-    let tasks = build_task_defs_for_request(context, &request, resolved_partition_key.canonical())?;
+    let mut tasks =
+        build_task_defs_for_request(context, &request, resolved_partition_key.canonical())?;
     let task_payloads = tasks
-        .iter()
+        .iter_mut()
         .map(|task| {
-            context
+            let payload = context
                 .task_payloads
                 .get(&task.key)
                 .cloned()
-                .map(|payload| (task.key.clone(), payload))
-                .ok_or_else(|| ApiError::internal("accepted task lacks execution declaration"))
+                .ok_or_else(|| ApiError::internal("accepted task lacks execution declaration"))?;
+            if pilot {
+                let asset = payload
+                    .get("asset")
+                    .ok_or_else(|| ApiError::internal("accepted task lacks asset declaration"))?;
+                crate::worker_pull_pilot::ExecutionLimits::parse(
+                    asset.get("execution").unwrap_or(&serde_json::Value::Null),
+                    asset.get("io").unwrap_or(&serde_json::Value::Null),
+                )?
+                .apply(task);
+            }
+            Ok((task.key.clone(), payload))
         })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
+        .collect::<Result<BTreeMap<_, _>, ApiError>>()?;
     let run_event_id = Ulid::new().to_string();
     let plan_event_id = Ulid::new().to_string();
     let accepted = arco_flow::orchestration::accepted_plan::AcceptedRunPlan {
@@ -4545,11 +4627,26 @@ pub(crate) async fn trigger_run(
             context.root_assets.clone(),
             tasks,
             Some(&RunEventOverrides {
-                run_event_id: run_event_id.clone(),
-                plan_event_id: plan_event_id.clone(),
+                run_event_id,
+                plan_event_id,
                 created_at: now,
             }),
         ),
+    };
+    let accepted = if pilot {
+        let plan = accepted
+            .with_rivers_retry_policy()
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        arco_flow::orchestration::worker_pull::WorkerPull::validate_plan(&plan)
+            .map_err(|error| pilot_acceptance_error(&error))?;
+        plan
+    } else {
+        accepted
+    };
+    let [run_event, plan_event] = accepted.events.as_slice() else {
+        return Err(ApiError::internal(
+            "execution plan must have two accepted events",
+        ));
     };
     let sha256 = accepted
         .persist(&storage, &run_id, &plan_id)
@@ -4560,19 +4657,15 @@ pub(crate) async fn trigger_run(
             run_key: run_key.clone(),
             run_id: run_id.clone(),
             plan_id: plan_id.clone(),
-            event_id: run_event_id,
-            plan_event_id: Some(plan_event_id),
+            event_id: run_event.event_id.clone(),
+            plan_event_id: Some(plan_event.event_id.clone()),
             request_fingerprint: request_fingerprint.clone(),
             accepted_plan_sha256: Some(sha256.clone()),
             created_at: now,
         };
-        let result = reserve_run_key(
-            &storage,
-            &reservation,
-            FingerprintPolicy::from_cutoff(state.config.run_key_fingerprint_cutoff),
-        )
-        .await
-        .map_err(|e| ApiError::internal(format!("failed to reserve run_key: {e}")))?;
+        let result = reserve_run_key(&storage, &reservation, fingerprint_policy)
+            .await
+            .map_err(|e| ApiError::internal(format!("failed to reserve run_key: {e}")))?;
         match normalize_trigger_run_reservation_result(result, &request_fingerprint_variants) {
             ReservationResult::Reserved => {}
             ReservationResult::AlreadyExists(existing) => {
@@ -4600,13 +4693,7 @@ pub(crate) async fn trigger_run(
             }
         }
     }
-    append_events_and_compact(
-        &state.config,
-        storage,
-        accepted.publication_events(&sha256),
-        Some(ctx.request_id.as_str()),
-    )
-    .await?;
+    publish_accepted_plan(&state, &ctx, &storage, &accepted, &sha256).await?;
 
     Ok((
         StatusCode::CREATED,
@@ -4648,6 +4735,7 @@ pub(crate) async fn rerun_run(
     Json(request): Json<RerunRunRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
+    require_legacy_flow_writes(&state.config)?;
 
     validate_labels_limits(&request.labels)?;
     validate_selection_limits(&request.selection)?;
@@ -4948,6 +5036,7 @@ pub(crate) async fn manual_evaluate_sensor(
     Json(request): Json<ManualSensorEvaluateRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
+    require_legacy_flow_writes(&state.config)?;
 
     let warning = match load_orchestration_state(&ctx, &state).await {
         Ok(fold_state) => {
@@ -5073,6 +5162,7 @@ pub(crate) async fn backfill_run_key(
     Json(request): Json<RunKeyBackfillRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
+    require_legacy_flow_writes(&state.config)?;
 
     if request.selection.is_empty() {
         return Err(ApiError::bad_request("selection cannot be empty"));
@@ -5300,6 +5390,7 @@ pub(crate) async fn list_runs(
         (status = 200, description = "Run cancelled", body = CancelRunResponse),
         (status = 404, description = "Run not found", body = ApiErrorBody),
         (status = 409, description = "Run already completed", body = ApiErrorBody),
+        (status = 503, description = "Cancellation needs a retry", body = ApiErrorBody),
     ),
     tag = "Orchestration",
     security(
@@ -5320,15 +5411,33 @@ pub(crate) async fn cancel_run(
     );
 
     ensure_workspace(&ctx, &workspace_id)?;
-    let service = state_service_for_cancel(&ctx, &state)?;
-    let outcome = service
-        .cancel_run(FlowCancelRunRequest {
-            run_id,
-            reason: request.reason,
-            requested_by: user_id_for_events(&ctx),
-        })
-        .await
-        .map_err(api_error_from_state_service_error)?;
+    let request = FlowCancelRunRequest {
+        run_id,
+        reason: request.reason,
+        requested_by: user_id_for_events(&ctx),
+    };
+    let outcome = if let Some(pilot) = state.worker_pull_pilot() {
+        use arco_flow::orchestration::worker_pull::PullError;
+
+        Box::pin(pilot.host.cancel_run(request))
+            .await
+            .map_err(|error| match error {
+                PullError::RunNotFound => ApiError::not_found("run not found"),
+                PullError::Conflict(message) => ApiError::conflict(message),
+                error => {
+                    tracing::warn!(%error, "worker-pull cancellation needs a retry");
+                    ApiError::from_status_and_message(
+                        StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                        "worker-pull cancellation needs a retry",
+                    )
+                }
+            })?
+    } else {
+        state_service_for_cancel(&ctx, &state)?
+            .cancel_run(request)
+            .await
+            .map_err(api_error_from_state_service_error)?
+    };
 
     Ok(Json(cancel_run_response_from_flow(outcome, Utc::now())))
 }
@@ -5360,6 +5469,7 @@ pub(crate) async fn upload_run_logs(
     Json(request): Json<RunLogsRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
+    require_legacy_flow_writes(&state.config)?;
 
     if request.attempt == 0 {
         return Err(ApiError::bad_request("attempt must be >= 1"));
@@ -5694,6 +5804,7 @@ pub(crate) async fn upsert_schedule(
     Json(request): Json<UpsertScheduleRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
+    require_legacy_flow_writes(&state.config)?;
     validate_schedule_upsert(&schedule_id, &request)?;
 
     let fold_state = load_orchestration_state(&ctx, &state).await?;
@@ -5794,6 +5905,7 @@ pub(crate) async fn enable_schedule(
     Json(_body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
+    require_legacy_flow_writes(&state.config)?;
 
     let fold_state = load_orchestration_state(&ctx, &state).await?;
     let existing = fold_state
@@ -5881,6 +5993,7 @@ pub(crate) async fn disable_schedule(
     Json(_body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
+    require_legacy_flow_writes(&state.config)?;
 
     let fold_state = load_orchestration_state(&ctx, &state).await?;
     let existing = fold_state
@@ -6203,6 +6316,7 @@ pub(crate) async fn create_backfill(
     Json(request): Json<CreateBackfillRequest>,
 ) -> Result<Response, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
+    require_legacy_flow_writes(&state.config)?;
 
     let CreateBackfillRequest {
         asset_selection,

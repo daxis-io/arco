@@ -143,6 +143,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
         &self,
         request: CommitOrchestrationBatchRequest,
     ) -> Result<CommitOrchestrationBatchResponse, ApiError> {
+        crate::worker_pull_pilot::require_legacy_flow_writes(&self.state.config)?;
         request
             .validate_contract()
             .map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -213,6 +214,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
         request: CommitRootTransactionRequest,
         claim_policy: IdempotencyClaimPolicy<'_>,
     ) -> Result<CommitRootTransactionResponse, ApiError> {
+        crate::worker_pull_pilot::require_legacy_flow_writes(&self.state.config)?;
         request
             .validate_contract()
             .map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -553,7 +555,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
                 ApiError::conflict(format!("failed to acquire root transaction lock: {error}"))
             })?;
         let fencing_token = guard.fencing_token().sequence();
-        let result = async {
+        let result = Box::pin(async {
             if mutations.iter().any(RootMutation::is_metastore) {
                 return Err(ApiError::not_implemented(
                     "metastore root mutations are not implemented yet",
@@ -794,7 +796,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
                 receipt,
                 repair_pending: root_repair_pending,
             })
-        }
+        })
         .await;
 
         if let Err(error) = guard.release().await {

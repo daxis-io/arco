@@ -34,6 +34,7 @@ arco-core = { path = "../arco-core", default-features = false }
 arco-proto = { path = "../arco-proto" }
 arco-worker-contract = { path = "../arco-worker-contract" }
 arco-storage = { path = "../arco-storage" }
+rivers-retry = { path = "../../vendor/rivers-retry-d7cbc206" }
 
 # Async runtime
 tokio = { workspace = true }

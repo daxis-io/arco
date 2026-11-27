@@ -68,6 +68,10 @@ pub mod rate_limit;
 pub(crate) mod redaction;
 pub mod routes;
 pub mod server;
+mod worker_pull_pilot;
+
+#[cfg(test)]
+mod worker_pull_pilot_tests;
 
 /// Prelude module for convenient imports.
 pub mod prelude {

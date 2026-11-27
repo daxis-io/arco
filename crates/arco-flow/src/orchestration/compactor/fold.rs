@@ -1264,8 +1264,16 @@ impl FoldState {
     }
 
     /// Processes an orchestration event and updates state.
-    #[allow(clippy::too_many_lines)]
     pub fn fold_event(&mut self, event: &OrchestrationEvent) {
+        self.fold_event_with_rivers_retry(event, false);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn fold_event_with_rivers_retry(
+        &mut self,
+        event: &OrchestrationEvent,
+        rivers_retry: bool,
+    ) {
         if self
             .idempotency_keys
             .contains_key(event.idempotency_key.as_str())
@@ -1400,6 +1408,7 @@ impl FoldState {
                     event.timestamp,
                     &event.tenant_id,
                     &event.workspace_id,
+                    false,
                 );
                 applied = changed;
                 if changed {
@@ -1444,6 +1453,7 @@ impl FoldState {
                     event.timestamp,
                     &event.tenant_id,
                     &event.workspace_id,
+                    rivers_retry,
                 );
                 let visibility_applied = if completion_applied && *outcome == TaskOutcome::Succeeded
                 {
@@ -2182,11 +2192,12 @@ impl FoldState {
         timestamp: DateTime<Utc>,
         tenant_id: &str,
         workspace_id: &str,
+        rivers_retry: bool,
     ) -> bool {
         let key = (run_id.to_string(), task_key.to_string());
 
         if let Some(task) = self.tasks.get(&key) {
-            if task.state.is_terminal()
+            if (task.state.is_terminal() || (rivers_retry && task.state == TaskState::RetryWait))
                 && task.attempt == attempt
                 && task.attempt_id.as_deref() == Some(attempt_id)
             {
@@ -2208,13 +2219,36 @@ impl FoldState {
         let metadata = Self::extract_execution_metadata(materialization_id, output, partition_key);
         let effective_partition_key = partition_key.or(metadata.delta_partition.as_deref());
 
+        let retry_cancelled = rivers_retry
+            && self
+                .runs
+                .get(run_id)
+                .is_some_and(|run| run.cancel_requested);
         if let Some(task) = self.tasks.get_mut(&key) {
+            let rivers_deadline = if rivers_retry
+                && outcome == TaskOutcome::Failed
+                && !retry_cancelled
+            {
+                super::super::retry_policy::retry_delay(
+                    task.max_attempts,
+                    attempt,
+                    failure_retryable.unwrap_or(true),
+                )
+                .and_then(|delay| Self::server_reference_time(event_id)?.checked_add_signed(delay))
+            } else {
+                None
+            };
+            let can_retry = if rivers_retry {
+                rivers_deadline.is_some()
+            } else {
+                failure_retryable.unwrap_or(true) && task.attempt < task.max_attempts
+            };
             let new_state = match outcome {
                 TaskOutcome::Succeeded => TaskState::Succeeded,
                 TaskOutcome::Failed => {
                     // Legacy and controller-authored failure facts have no
                     // structured error, so preserve their retryable behavior.
-                    if failure_retryable.unwrap_or(true) && task.attempt < task.max_attempts {
+                    if can_retry {
                         TaskState::RetryWait
                     } else {
                         TaskState::Failed
@@ -2250,8 +2284,11 @@ impl FoldState {
                         // server-minted event-id time, never the worker's
                         // reported completion clock, and the addition is
                         // checked so a pathological id cannot panic or wrap.
-                        task.retry_not_before =
-                            Self::retry_deadline(event_id, timestamp, task.attempt);
+                        task.retry_not_before = if rivers_retry {
+                            rivers_deadline
+                        } else {
+                            Self::retry_deadline(event_id, timestamp, task.attempt)
+                        };
                     } else {
                         task.retry_not_before = None;
                     }

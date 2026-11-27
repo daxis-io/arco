@@ -172,13 +172,24 @@ async fn allocated_table_replays_and_uses_one_analytical_log_root() {
         table_id,
     )
     .await;
+    assert_changed_root_denied(catalog, data, &fixture, &actor, table_id, &location).await;
+}
+
+async fn assert_changed_root_denied(
+    catalog: Arc<dyn StorageBackend>,
+    data: Arc<dyn StorageBackend>,
+    fixture: &TableReadFixture,
+    actor: &str,
+    table_id: Uuid,
+    location: &str,
+) {
     let wrong_root =
         ManagedDeltaRoot::parse("s3://analytical-bucket/different").expect("other root");
     let moved = router(catalog, data, &wrong_root);
-    let before = fixture_object_versions(&fixture).await;
+    let before = fixture_object_versions(fixture).await;
     let stage = format!("/api/v1/delta/tables/{table_id}/commits/stage");
     assert_eq!(
-        post_json(&moved, &stage, &actor, json!({"payload": "{}"}))
+        post_json(&moved, &stage, actor, json!({"payload": "{}"}))
             .await
             .0,
         StatusCode::PRECONDITION_FAILED,
@@ -186,12 +197,12 @@ async fn allocated_table_replays_and_uses_one_analytical_log_root() {
     let preview = "/api/2.1/unity-catalog/delta/preview/commits";
     let request_body = json!({"table_id": table_id, "table_uri": location});
     assert_eq!(
-        request(&moved, "GET", preview, &actor, &request_body)
+        request(&moved, "GET", preview, actor, &request_body)
             .await
             .0,
         StatusCode::CONFLICT,
     );
-    assert_eq!(fixture_object_versions(&fixture).await, before);
+    assert_eq!(fixture_object_versions(fixture).await, before);
 }
 
 async fn assert_split_delta_commits(

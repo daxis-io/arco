@@ -283,8 +283,6 @@ async fn assert_allocated_pin(
         .expect("publish analytical governance");
     let mut cfg = production_rs256_config(STORAGE_ROOT);
     cfg.managed_delta_root = Some(root.as_uri().to_string());
-    cfg.unity_catalog.enabled = true;
-    cfg.unity_catalog.table_reads_enabled = true;
     let serving = Server::with_storage_backend(cfg, catalog)
         .with_managed_delta_storage(ManagedDeltaStorage::new(root.clone(), data))
         .test_router();

@@ -8915,7 +8915,7 @@ mod tests {
                 options.clone(),
             )
         };
-        let (first, second) = tokio::join!(allocate(), allocate());
+        let outcomes = tokio::join!(allocate(), allocate());
         let replay = writer
             .allocate_managed_delta(
                 "analytics",
@@ -8927,7 +8927,7 @@ mod tests {
             .await
             .expect("replay");
         let mut successful = 0;
-        for outcome in [first, second] {
+        for outcome in <[_; 2]>::from(outcomes) {
             match outcome {
                 Ok(table) => {
                     assert_eq!(table.id, replay.id);
